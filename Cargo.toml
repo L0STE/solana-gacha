@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["program", "tests"]
+
+[workspace.dependencies]
+gacha-program = { path = "program" }
+solana-ecvrf = "0.0.1"
+
+# Financial boundaries use checked arithmetic as well as runtime overflow checks.
+[profile.release]
+overflow-checks = true
+
+[profile.dev]
+overflow-checks = true

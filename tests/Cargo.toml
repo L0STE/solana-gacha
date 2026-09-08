@@ -1,0 +1,29 @@
+[package]
+name = "gacha-tests"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+gacha-program = { workspace = true, features = ["test-utils"] }
+solana-ecvrf = { workspace = true, features = ["prove"] }
+mollusk-svm = "0.15.1"
+mollusk-svm-programs-token = "0.15.1"
+solana-instruction = "3"
+solana-account = "4"
+solana-pubkey = "4"
+solana-sha256-hasher = "3"
+solana-program-error = "3"
+solana-message = { version = "4.4", features = ["wincode"] }
+
+[dev-dependencies]
+mollusk-svm-bencher = "0.15.1"
+serde_json = "1"
+
+[[bench]]
+name = "compute_units"
+harness = false

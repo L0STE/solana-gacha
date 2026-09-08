@@ -1,0 +1,25 @@
+{
+  "name": "@blueshift-gg/gacha",
+  "version": "0.0.1",
+  "description": "Version-bound Solana gacha purchases and verified settlement instructions.",
+  "license": "MIT",
+  "repository": "github:L0STE/solana-gacha",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": ["dist/src"],
+  "scripts": { "build": "tsc -b" },
+  "peerDependencies": { "@blueshift-gg/solana-ecvrf": "^0.0.1" },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@solana/addresses": "8.2.0",
+    "@solana/instructions": "8.2.0",
+    "@solana/rpc": "8.2.0",
+    "@solana/transaction-messages": "8.2.0"
+  }
+}

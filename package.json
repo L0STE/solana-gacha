@@ -1,0 +1,15 @@
+{
+  "name": "solana-gacha-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "tsc -b packages/gacha",
+    "test": "bun run build && tsc -p tsconfig.test.json && bun test"
+  },
+  "devDependencies": {
+    "@blueshift-gg/solana-ecvrf": "^0.0.1",
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.9.0"
+  }
+}
