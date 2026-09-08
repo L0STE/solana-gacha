@@ -51,9 +51,20 @@ pub enum GachaError {
     DeadlinePassed,
     /// Restocking changed the candidate list since the buyer prepared the purchase
     InventoryChanged,
+    /// The buyback terms or pool authority signature are invalid.
+    InvalidQuote,
+    /// The buyback quote has expired.
+    QuoteExpired,
+    /// The prize is not a supported Core asset or has the wrong owner/collection.
+    InvalidAsset,
+    /// This operation or transition is not allowed in the pool's current status.
+    InvalidPoolStatus,
+    /// Resolve pending purchases before reclaiming unsold inventory.
+    PendingPurchases,
 }
 
 impl From<GachaError> for ProgramError {
+    #[inline]
     fn from(e: GachaError) -> Self {
         ProgramError::Custom(e as u32)
     }

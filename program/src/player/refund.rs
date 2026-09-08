@@ -43,6 +43,9 @@ pub(crate) struct Refund<'a> {
     buyer: &'a AccountInfo,
     vault: &'a AccountInfo,
     buyer_ata: &'a AccountInfo,
+    amount: u64,
+    pending_draws: u64,
+    next_settle: u64,
 }
 
 impl<'a> TryFrom<&'a [AccountInfo]> for Refund<'a> {
@@ -57,56 +60,59 @@ impl<'a> TryFrom<&'a [AccountInfo]> for Refund<'a> {
         if !pool.is_writable() || !pull.is_writable() {
             return Err(GachaError::NotMutable.into());
         }
-        Pool::check(pool)?;
-        Pull::check(pull)?;
+        crate::state::check_pool(pool)?;
+        crate::state::check_pull(pull)?;
+        let pool_state = unsafe { Pool::from_bytes_unchecked(pool.borrow_data_unchecked()) };
+        let pull_state = unsafe { Pull::from_bytes_unchecked(pull.borrow_data_unchecked()) };
+        if pull_state.pool().ne(pool.key()) || pull_state.status() != STATUS_PENDING {
+            return Err(GachaError::InvalidPullStatus.into());
+        }
+        if pull_state.index() != pool_state.next_settle() {
+            return Err(GachaError::NotNextInQueue.into());
+        }
+        if Clock::get()?.slot <= pull_state.deadline_slot() {
+            return Err(GachaError::DeadlineNotReached.into());
+        }
+        if pull_state.buyer().ne(buyer.key()) {
+            return Err(GachaError::InvalidBuyer.into());
+        }
+        if pool_state.vault().ne(vault.key()) {
+            return Err(GachaError::InvalidTokenAddress.into());
+        }
+        let (owner, _, _) = token_account(buyer_ata)?;
+        if owner.ne(pull_state.buyer()) {
+            return Err(GachaError::InvalidTokenAddress.into());
+        }
+        let count = pull_state.count() as u64;
+        let amount = pool_state.refund_amount(count)?;
+        let pending_draws = pool_state
+            .pending_draws()
+            .checked_sub(count)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let next_settle = pull_state
+            .index()
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
         Ok(Self {
             pool,
             pull,
             buyer,
             vault,
             buyer_ata,
+            amount,
+            pending_draws,
+            next_settle,
         })
     }
 }
 
-impl<'a> Refund<'a> {
+impl Refund<'_> {
     pub(crate) const DISCRIMINATOR: u8 = 11;
 
     pub(crate) fn process(self) -> ProgramResult {
         let pool = unsafe { Pool::from_bytes_unchecked_mut(self.pool.borrow_mut_data_unchecked()) };
-        let pull = unsafe { Pull::from_bytes_unchecked(self.pull.borrow_data_unchecked()) };
-        if pull.pool().ne(self.pool.key()) || pull.status() != STATUS_PENDING {
-            return Err(GachaError::InvalidPullStatus.into());
-        }
-        if pull.index() != pool.next_settle() {
-            return Err(GachaError::NotNextInQueue.into());
-        }
-        if Clock::get()?.slot <= pull.deadline_slot() {
-            return Err(GachaError::DeadlineNotReached.into());
-        }
-        if pull.buyer().ne(self.buyer.key()) {
-            return Err(GachaError::InvalidBuyer.into());
-        }
-        if pool.vault().ne(self.vault.key()) {
-            return Err(GachaError::InvalidTokenAddress.into());
-        }
-        let (owner, _, _) = token_account(self.buyer_ata)?;
-        if owner.ne(pull.buyer()) {
-            return Err(GachaError::InvalidTokenAddress.into());
-        }
-
-        let count = pull.count() as u64;
-        let amount = pool.refund_amount(count)?;
-        pool.set_pending_draws(
-            pool.pending_draws()
-                .checked_sub(count)
-                .ok_or(ProgramError::ArithmeticOverflow)?,
-        );
-        pool.set_next_settle(
-            pull.index()
-                .checked_add(1)
-                .ok_or(ProgramError::ArithmeticOverflow)?,
-        );
+        pool.set_pending_draws(self.pending_draws);
+        pool.set_next_settle(self.next_settle);
 
         let id = pool.id().to_le_bytes();
         let bump = [pool.bump()];
@@ -120,7 +126,7 @@ impl<'a> Refund<'a> {
             from: self.vault,
             to: self.buyer_ata,
             authority: self.pool,
-            amount,
+            amount: self.amount,
         }
         .invoke_signed(&[Signer::from(&seeds)])?;
 

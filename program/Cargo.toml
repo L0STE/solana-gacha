@@ -2,7 +2,7 @@
 name = "gacha-program"
 version = "0.0.1"
 edition = "2021"
-description = "A Solana gacha with on-chain ECVRF verification, live inventory and funded timeout refunds"
+description = "A Metaplex Core NFT gacha with on-chain ECVRF verification, live inventory and funded timeout refunds"
 license = "MIT"
 repository = "https://github.com/L0STE/solana-gacha"
 
@@ -12,14 +12,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"
 [features]
 default = []
 ix-logs = []
-test-utils = []
-rpc = ["dep:solana-rpc-client", "dep:solana-account-decoder-client-types"]
 
 [lib]
-crate-type = ["lib", "cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
-pinocchio = "=0.8.4"
+brine-ed25519 = "0.9.3"
+gacha-core = { workspace = true }
+pinocchio = { workspace = true }
 pinocchio-associated-token-account = "0.2.0"
 pinocchio-system = "0.2.3"
 pinocchio-token = "0.3.0"
@@ -27,14 +27,3 @@ solana-ecvrf = { workspace = true }
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]
 sha2 = { version = "0.10", default-features = false }
-solana-instruction = "3"
-solana-pubkey = "4"
-solana-message = { version = "4.4", features = ["wincode"] }
-spl-associated-token-account-interface = "2"
-solana-rpc-client = { version = "=4.2.2", default-features = false, optional = true }
-solana-account-decoder-client-types = { version = "=4.2.2", features = ["agave-unstable-api"], optional = true }
-
-[dev-dependencies]
-base64 = "0.22"
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt"] }

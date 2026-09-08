@@ -1,14 +1,6 @@
-use crate::constants::*;
 use crate::errors::GachaError;
-use crate::helpers::token_account;
 use crate::state::Pool;
-use pinocchio::{
-    account_info::AccountInfo,
-    instruction::{Seed, Signer},
-    program_error::ProgramError,
-    ProgramResult,
-};
-use pinocchio_token::instructions::Transfer;
+use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};
 
 /// # Withdraw
 ///
@@ -34,42 +26,10 @@ use pinocchio_token::instructions::Transfer;
 ///
 /// Instruction Checks:
 /// - amount ≤ free balance
-struct WithdrawAccounts<'a> {
+pub(crate) struct Withdraw<'a> {
     pool: &'a AccountInfo,
     vault: &'a AccountInfo,
     destination: &'a AccountInfo,
-}
-
-impl<'a> TryFrom<&'a [AccountInfo]> for WithdrawAccounts<'a> {
-    type Error = ProgramError;
-
-    fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
-        let [authority, pool, vault, destination, _token_program] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        if !authority.is_signer() {
-            return Err(GachaError::NotSigner.into());
-        }
-        Pool::check(pool)?;
-        let header = unsafe { Pool::from_bytes_unchecked(pool.borrow_data_unchecked()) };
-        if header.authority().ne(authority.key()) {
-            return Err(GachaError::InvalidAuthority.into());
-        }
-        if header.vault().ne(vault.key()) {
-            return Err(GachaError::InvalidTokenAddress.into());
-        }
-
-        Ok(Self {
-            pool,
-            vault,
-            destination,
-        })
-    }
-}
-
-pub(crate) struct Withdraw<'a> {
-    accounts: WithdrawAccounts<'a>,
     amount: u64,
 }
 
@@ -78,45 +38,36 @@ impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Withdraw<'a> {
 
     fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
         pinocchio::log::sol_log("Withdraw");
-
         if data.len() != 8 {
             return Err(ProgramError::InvalidInstructionData);
         }
+        let [authority, pool, vault, destination, _token_program] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if !authority.is_signer() {
+            return Err(GachaError::NotSigner.into());
+        }
+        crate::state::check_pool(pool)?;
+        let header = unsafe { Pool::from_bytes_unchecked(pool.borrow_data_unchecked()) };
+        if header.authority().ne(authority.key()) {
+            return Err(GachaError::InvalidAuthority.into());
+        }
+        if header.vault().ne(vault.key()) {
+            return Err(GachaError::InvalidTokenAddress.into());
+        }
         Ok(Self {
-            accounts: WithdrawAccounts::try_from(accounts)?,
+            pool,
+            vault,
+            destination,
             amount: u64::from_le_bytes(data.try_into().unwrap()),
         })
     }
 }
 
-impl<'a> Withdraw<'a> {
+impl Withdraw<'_> {
     pub(crate) const DISCRIMINATOR: u8 = 2;
 
     pub(crate) fn process(self) -> ProgramResult {
-        let accounts = &self.accounts;
-        let pool = unsafe { Pool::from_bytes_unchecked(accounts.pool.borrow_data_unchecked()) };
-        let (_, _, vault_balance) = token_account(accounts.vault)?;
-        let free_balance = vault_balance
-            .checked_sub(pool.refund_amount(pool.pending_draws())?)
-            .ok_or(GachaError::InsufficientBalance)?;
-        if self.amount > free_balance {
-            return Err(GachaError::InsufficientBalance.into());
-        }
-
-        let id = pool.id().to_le_bytes();
-        let bump = [pool.bump()];
-        let seeds = [
-            Seed::from(POOL_SEED),
-            Seed::from(pool.authority()),
-            Seed::from(&id),
-            Seed::from(&bump),
-        ];
-        Transfer {
-            from: accounts.vault,
-            to: accounts.destination,
-            authority: accounts.pool,
-            amount: self.amount,
-        }
-        .invoke_signed(&[Signer::from(&seeds)])
+        crate::helpers::pay_surplus(self.pool, self.vault, self.destination, self.amount)
     }
 }

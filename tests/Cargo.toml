@@ -9,7 +9,9 @@ license = "MIT"
 path = "src/lib.rs"
 
 [dependencies]
-gacha-program = { workspace = true, features = ["test-utils"] }
+ed25519-dalek = "2"
+gacha-core = { workspace = true }
+gacha-rust = { workspace = true, features = ["rpc"] }
 solana-ecvrf = { workspace = true, features = ["prove"] }
 mollusk-svm = "0.15.1"
 mollusk-svm-programs-token = "0.15.1"
@@ -21,8 +23,12 @@ solana-program-error = "3"
 solana-message = { version = "4.4", features = ["wincode"] }
 
 [dev-dependencies]
+mpl-core = "0.12.1"
+base64 = "0.22"
 mollusk-svm-bencher = "0.15.1"
 serde_json = "1"
+solana-rpc-client = { version = "=4.2.2", default-features = false }
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [[bench]]
 name = "compute_units"

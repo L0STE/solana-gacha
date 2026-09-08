@@ -10,7 +10,7 @@ use pinocchio_token::instructions::Transfer;
 
 /// # CreatePool
 ///
-/// Open a banner: fixed tier odds, price, settle deadline and the operator
+/// Create a paused banner: fixed tier odds, price, settle deadline and the operator
 /// whose Ed25519 key is the VRF key. The authority posts the bond in the same
 /// instruction.
 ///
@@ -43,25 +43,33 @@ use pinocchio_token::instructions::Transfer;
 /// Instruction Checks:
 /// - 1 ≤ tier_count ≤ 8, every used weight nonzero; nonzero price, penalty
 ///   and deadline; payment plus penalty must fit for up to ten draws
-struct CreatePoolAccounts<'a> {
+pub(crate) struct CreatePool<'a> {
     authority: &'a AccountInfo,
     pool: &'a AccountInfo,
     operator: &'a AccountInfo,
     payment_mint: &'a AccountInfo,
     vault: &'a AccountInfo,
     authority_ata: &'a AccountInfo,
+    id: u64,
+    price: u64,
+    deadline_slots: u64,
+    bond_per_draw: u64,
+    bond: u64,
+    tier_count: u8,
+    weights: [u32; MAX_TIERS],
+    bump: u8,
 }
 
-impl<'a> TryFrom<&'a [AccountInfo]> for CreatePoolAccounts<'a> {
+impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for CreatePool<'a> {
     type Error = ProgramError;
 
-    fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
+    fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
+        pinocchio::log::sol_log("CreatePool");
         let [authority, pool, operator, payment_mint, vault, authority_ata, _token_program, _system_program] =
             accounts
         else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
-
         if !authority.is_signer() {
             return Err(GachaError::NotSigner.into());
         }
@@ -72,7 +80,44 @@ impl<'a> TryFrom<&'a [AccountInfo]> for CreatePoolAccounts<'a> {
         if owner.ne(pool.key()) || mint.ne(payment_mint.key()) {
             return Err(GachaError::InvalidTokenAddress.into());
         }
-
+        if data.len() != 73 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let u64_at = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let id = u64_at(0);
+        let price = u64_at(8);
+        let deadline_slots = u64_at(16);
+        let bond_per_draw = u64_at(24);
+        let bond = u64_at(32);
+        let tier_count = data[40];
+        let mut weights = [0u32; MAX_TIERS];
+        for (i, weight) in weights.iter_mut().enumerate() {
+            *weight = u32::from_le_bytes(data[41 + i * 4..45 + i * 4].try_into().unwrap());
+        }
+        if tier_count == 0
+            || tier_count as usize > MAX_TIERS
+            || weights[..tier_count as usize].contains(&0)
+            || price == 0
+            || bond_per_draw == 0
+            || deadline_slots == 0
+            || price
+                .checked_add(bond_per_draw)
+                .and_then(|amount| amount.checked_mul(MAX_COUNT as u64))
+                .is_none()
+        {
+            return Err(GachaError::InvalidPoolParams.into());
+        }
+        solana_ecvrf::PublicKey(*operator.key())
+            .validate()
+            .map_err(|_| GachaError::InvalidOperator)?;
+        let (pool_key, bump) =
+            find_program_address(&[POOL_SEED, authority.key(), &id.to_le_bytes()], &crate::ID);
+        if pool_key.ne(pool.key()) {
+            return Err(GachaError::InvalidAccountOwner.into());
+        }
+        if vault.key().ne(&ata(&pool_key, payment_mint.key())) {
+            return Err(GachaError::InvalidTokenAddress.into());
+        }
         Ok(Self {
             authority,
             pool,
@@ -80,138 +125,57 @@ impl<'a> TryFrom<&'a [AccountInfo]> for CreatePoolAccounts<'a> {
             payment_mint,
             vault,
             authority_ata,
-        })
-    }
-}
-
-struct CreatePoolArgs {
-    id: u64,
-    price: u64,
-    deadline_slots: u64,
-    bond_per_draw: u64,
-    bond: u64,
-    tier_count: u8,
-    weights: [u32; MAX_TIERS],
-}
-
-impl<'a> TryFrom<&'a [u8]> for CreatePoolArgs {
-    type Error = ProgramError;
-
-    fn try_from(data: &'a [u8]) -> Result<Self, Self::Error> {
-        if data.len() != 73 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let u64_at = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let mut weights = [0u32; MAX_TIERS];
-        for (i, weight) in weights.iter_mut().enumerate() {
-            *weight = u32::from_le_bytes(data[41 + i * 4..45 + i * 4].try_into().unwrap());
-        }
-        Ok(Self {
-            id: u64_at(0),
-            price: u64_at(8),
-            deadline_slots: u64_at(16),
-            bond_per_draw: u64_at(24),
-            bond: u64_at(32),
-            tier_count: data[40],
+            id,
+            price,
+            deadline_slots,
+            bond_per_draw,
+            bond,
+            tier_count,
             weights,
+            bump,
         })
     }
 }
 
-pub(crate) struct CreatePool<'a> {
-    accounts: CreatePoolAccounts<'a>,
-    args: CreatePoolArgs,
-}
-
-impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for CreatePool<'a> {
-    type Error = ProgramError;
-
-    fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
-        pinocchio::log::sol_log("CreatePool");
-
-        let accounts = CreatePoolAccounts::try_from(accounts)?;
-        let args = CreatePoolArgs::try_from(data)?;
-
-        Ok(Self { accounts, args })
-    }
-}
-
-impl<'a> CreatePool<'a> {
+impl CreatePool<'_> {
     pub(crate) const DISCRIMINATOR: u8 = 0;
 
     pub(crate) fn process(self) -> ProgramResult {
-        let accounts = &self.accounts;
-        let config = &self.args;
-
-        let tier_count = config.tier_count as usize;
-        if tier_count == 0
-            || tier_count > MAX_TIERS
-            || config.weights[..tier_count].contains(&0)
-            || config.price == 0
-            || config.bond_per_draw == 0
-            || config.deadline_slots == 0
-            || config
-                .price
-                .checked_add(config.bond_per_draw)
-                .and_then(|amount| amount.checked_mul(MAX_COUNT as u64))
-                .is_none()
-        {
-            return Err(GachaError::InvalidPoolParams.into());
-        }
-        solana_ecvrf::PublicKey(*accounts.operator.key())
-            .validate()
-            .map_err(|_| GachaError::InvalidOperator)?;
-
-        let id = config.id.to_le_bytes();
-        let (pool_key, bump) =
-            find_program_address(&[POOL_SEED, accounts.authority.key(), &id], &crate::ID);
-        if pool_key.ne(accounts.pool.key()) {
-            return Err(GachaError::InvalidAccountOwner.into());
-        }
-        if accounts
-            .vault
-            .key()
-            .ne(&ata(&pool_key, accounts.payment_mint.key()))
-        {
-            return Err(GachaError::InvalidTokenAddress.into());
-        }
-
-        let bump_seed = [bump];
+        let id = self.id.to_le_bytes();
+        let bump = [self.bump];
         create_pda(
-            accounts.authority,
-            accounts.pool,
+            self.authority,
+            self.pool,
             POOL_LEN,
             &[
                 Seed::from(POOL_SEED),
-                Seed::from(accounts.authority.key()),
+                Seed::from(self.authority.key()),
                 Seed::from(&id),
-                Seed::from(&bump_seed),
+                Seed::from(&bump),
             ],
         )?;
-
-        let pool =
-            unsafe { Pool::from_bytes_unchecked_mut(accounts.pool.borrow_mut_data_unchecked()) };
+        let pool = unsafe { Pool::from_bytes_unchecked_mut(self.pool.borrow_mut_data_unchecked()) };
         pool.set_version(POOL_VERSION);
-        pool.set_bump(bump);
-        pool.set_tier_count(config.tier_count);
-        pool.set_authority(*accounts.authority.key());
-        pool.set_operator(*accounts.operator.key());
-        pool.set_payment_mint(*accounts.payment_mint.key());
-        pool.set_vault(*accounts.vault.key());
-        pool.set_id(config.id);
-        pool.set_price(config.price);
-        pool.set_deadline_slots(config.deadline_slots);
-        pool.set_bond_per_draw(config.bond_per_draw);
-        for (tier, &weight) in pool.tiers_mut().iter_mut().zip(&config.weights) {
+        pool.set_bump(self.bump);
+        pool.set_tier_count(self.tier_count);
+        pool.set_status(POOL_PAUSED);
+        pool.set_authority(*self.authority.key());
+        pool.set_operator(*self.operator.key());
+        pool.set_payment_mint(*self.payment_mint.key());
+        pool.set_vault(*self.vault.key());
+        pool.set_id(self.id);
+        pool.set_price(self.price);
+        pool.set_deadline_slots(self.deadline_slots);
+        pool.set_bond_per_draw(self.bond_per_draw);
+        for (tier, &weight) in pool.tiers_mut().iter_mut().zip(&self.weights) {
             tier.set_weight(weight);
         }
-
-        if config.bond > 0 {
+        if self.bond > 0 {
             Transfer {
-                from: accounts.authority_ata,
-                to: accounts.vault,
-                authority: accounts.authority,
-                amount: config.bond,
+                from: self.authority_ata,
+                to: self.vault,
+                authority: self.authority,
+                amount: self.bond,
             }
             .invoke()?;
         }

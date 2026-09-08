@@ -90,8 +90,7 @@ pub(crate) fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The ATA of `owner` for `mint`. Used only at pool creation and deposit;
-/// settlement and delivery validate stored identities without deriving ATAs.
+/// The payment ATA of `owner` for `mint`, used to validate the pool vault.
 #[inline(always)]
 pub(crate) fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     pinocchio::pubkey::find_program_address(
@@ -110,11 +109,13 @@ pub(crate) fn token_account(
         return Err(crate::errors::GachaError::InvalidTokenAddress.into());
     }
     let data = unsafe { account.borrow_data_unchecked() };
-    let (owner, mint) = crate::state::token_account_owner_and_mint(data);
-    Ok((owner, mint, crate::state::token_account_amount(data)))
+    let owner = unsafe { &*(data.as_ptr().add(32) as *const Pubkey) };
+    let mint = unsafe { &*(data.as_ptr() as *const Pubkey) };
+    let amount = u64::from_le_bytes(data[64..72].try_into().unwrap());
+    Ok((owner, mint, amount))
 }
 
-/// Proof and awarded mints. Auditing selection also requires the pool's
+/// Proof and awarded Core assets. Auditing selection also requires the pool's
 /// inventory history, since deposits remain open while pulls are pending.
 const SETTLE_DISCRIMINATOR: u8 = 0;
 
@@ -129,4 +130,39 @@ pub(crate) fn log_settle_event(
     let head = [SETTLE_DISCRIMINATOR];
     let data: [&[u8]; 6] = [&head, pull, alpha, proof, beta, outcomes];
     pinocchio::log::sol_log_data(&data);
+}
+
+/// Pay only funds left after reserving every pending refund and penalty.
+pub(crate) fn pay_surplus(
+    pool_account: &AccountInfo,
+    vault: &AccountInfo,
+    destination: &AccountInfo,
+    amount: u64,
+) -> pinocchio::ProgramResult {
+    use crate::{constants::POOL_SEED, errors::GachaError, state::Pool};
+    use pinocchio_token::instructions::Transfer;
+    let pool = unsafe { Pool::from_bytes_unchecked(pool_account.borrow_data_unchecked()) };
+    let (_, _, vault_balance) = token_account(vault)?;
+    let free_balance = vault_balance
+        .checked_sub(pool.refund_amount(pool.pending_draws())?)
+        .ok_or(GachaError::InsufficientBalance)?;
+    if amount > free_balance {
+        return Err(GachaError::InsufficientBalance.into());
+    }
+
+    let id = pool.id().to_le_bytes();
+    let bump = [pool.bump()];
+    let seeds = [
+        Seed::from(POOL_SEED),
+        Seed::from(pool.authority()),
+        Seed::from(&id),
+        Seed::from(&bump),
+    ];
+    Transfer {
+        from: vault,
+        to: destination,
+        authority: pool_account,
+        amount,
+    }
+    .invoke_signed(&[Signer::from(&seeds)])
 }

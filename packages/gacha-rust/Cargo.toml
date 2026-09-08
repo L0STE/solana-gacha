@@ -1,0 +1,22 @@
+[package]
+name = "gacha-rust"
+version = "0.0.1"
+edition = "2021"
+description = "Rust snapshots and verified settlement instructions for Solana Gacha"
+license = "MIT"
+repository = "https://github.com/L0STE/solana-gacha"
+
+[features]
+default = []
+rpc = ["dep:solana-rpc-client", "dep:solana-account-decoder-client-types"]
+
+[dependencies]
+gacha-core = { workspace = true }
+solana-ecvrf = { workspace = true }
+sha2 = { version = "0.10", default-features = false }
+solana-instruction = "3"
+solana-pubkey = "4"
+solana-message = { version = "4.4", features = ["wincode"] }
+spl-associated-token-account-interface = "2"
+solana-rpc-client = { version = "=4.2.2", default-features = false, optional = true }
+solana-account-decoder-client-types = { version = "=4.2.2", features = ["agave-unstable-api"], optional = true }

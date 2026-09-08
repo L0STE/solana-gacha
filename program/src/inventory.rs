@@ -1,7 +1,7 @@
 //! Append-only prize positions with mutable availability. A purchase commits
 //! to a prefix; deposits beyond that prefix cannot affect any of its draws.
 //!
-//! Each 96-byte block holds 64 tier tags (zero means awarded) and eight Fenwick
+//! Each 96-byte block holds 64 tier tags (zero means removed) and eight Fenwick
 //! counts. Prefix counts and rank selection cost O(log(blocks) + 64), without
 //! scanning dead prizes, copying snapshots, or passing additional accounts.
 //! ponytail: positions are never recycled; the pool grows by 96 bytes per 64
@@ -11,13 +11,11 @@
 use crate::{constants::MAX_TIERS, errors::GachaError};
 use pinocchio::program_error::ProgramError;
 
-const POSITIONS_PER_BLOCK: usize = 64;
-const COUNTS_LEN: usize = MAX_TIERS * 4;
-const BLOCK_LEN: usize = COUNTS_LEN + POSITIONS_PER_BLOCK;
-
-pub(crate) fn space(positions: u32) -> usize {
-    (positions as usize).div_ceil(POSITIONS_PER_BLOCK) * BLOCK_LEN
-}
+pub(crate) use crate::constants::inventory_space as space;
+use crate::constants::{
+    INVENTORY_BLOCK_LEN as BLOCK_LEN, INVENTORY_COUNTS_LEN as COUNTS_LEN,
+    INVENTORY_TAGS_PER_BLOCK as POSITIONS_PER_BLOCK,
+};
 
 pub(crate) struct Inventory<'a> {
     data: &'a mut [u8],
@@ -132,6 +130,119 @@ impl<'a> Inventory<'a> {
         }
         Err(GachaError::InvalidItem.into())
     }
+
+    /// Remove one known unsold position during retirement.
+    pub(crate) fn remove(&mut self, position: u32, tier: u8) -> Result<(), ProgramError> {
+        let block = position as usize / POSITIONS_PER_BLOCK;
+        let offset = position as usize % POSITIONS_PER_BLOCK;
+        let tag = self
+            .data
+            .get_mut(block * BLOCK_LEN + COUNTS_LEN + offset)
+            .filter(|tag| **tag == tier + 1)
+            .ok_or(GachaError::InvalidItem)?;
+        *tag = 0;
+        let mut node = block + 1;
+        while node <= self.blocks() {
+            let count = self
+                .count(node, tier as usize)
+                .checked_sub(1)
+                .ok_or(GachaError::InvalidItem)?;
+            self.set_count(node, tier as usize, count);
+            node += node & node.wrapping_neg();
+        }
+        Ok(())
+    }
+}
+
+/// Append one custody-backed prize at a fresh position. Payer funds item and index rent.
+pub(crate) fn restock(
+    payer: &pinocchio::account_info::AccountInfo,
+    pool_account: &pinocchio::account_info::AccountInfo,
+    item_account: &pinocchio::account_info::AccountInfo,
+    asset: &pinocchio::pubkey::Pubkey,
+    tier: u8,
+) -> pinocchio::ProgramResult {
+    use crate::{
+        constants::*,
+        helpers::create_pda,
+        state::{Item, Pool},
+    };
+    use pinocchio::{
+        instruction::Seed,
+        pubkey::find_program_address,
+        sysvars::{rent::Rent, Sysvar},
+    };
+    let pool = unsafe { Pool::from_bytes_unchecked(pool_account.borrow_data_unchecked()) };
+    if pool.status() == POOL_RETIRED {
+        return Err(GachaError::InvalidPoolStatus.into());
+    }
+    if tier >= pool.tier_count() {
+        return Err(GachaError::InvalidTier.into());
+    }
+    let position = pool.inventory_version();
+    let next_position = position
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let remaining = pool.tiers()[tier as usize]
+        .remaining()
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let tier_seed = [tier];
+    let position_seed = position.to_le_bytes();
+    let (item_key, bump) = find_program_address(
+        &[ITEM_SEED, pool_account.key(), &tier_seed, &position_seed],
+        &crate::ID,
+    );
+    if item_key.ne(item_account.key()) {
+        return Err(GachaError::InvalidItem.into());
+    }
+    let bump_seed = [bump];
+    create_pda(
+        payer,
+        item_account,
+        ITEM_LEN,
+        &[
+            Seed::from(ITEM_SEED),
+            Seed::from(pool_account.key()),
+            Seed::from(&tier_seed),
+            Seed::from(&position_seed),
+            Seed::from(&bump_seed),
+        ],
+    )?;
+
+    let space = POOL_LEN + space(next_position);
+    if space != pool_account.data_len() {
+        let missing = Rent::get()?
+            .minimum_balance(space)
+            .saturating_sub(pool_account.lamports());
+        if missing > 0 {
+            pinocchio_system::instructions::Transfer {
+                from: payer,
+                to: pool_account,
+                lamports: missing,
+            }
+            .invoke()?;
+        }
+        pool_account.realloc(space, false)?;
+    }
+
+    let item = unsafe { Item::from_bytes_unchecked_mut(item_account.borrow_mut_data_unchecked()) };
+    item.set_version(ITEM_VERSION);
+    item.set_bump(bump);
+    item.set_tier(tier);
+    item.set_position(position);
+    item.set_pool(*pool_account.key());
+    item.set_asset(*asset);
+
+    let data = unsafe { pool_account.borrow_mut_data_unchecked() };
+    let (header, index) = data.split_at_mut(POOL_LEN);
+    let pool = unsafe { Pool::from_bytes_unchecked_mut(header) };
+    Inventory::new(index).append(position, tier);
+    pool.set_inventory_version(next_position);
+    let tier = &mut pool.tiers_mut()[tier as usize];
+    tier.set_remaining(remaining);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,6 +299,14 @@ mod tests {
             }
         }
         let mut index = Inventory::new(&mut data);
+        // Retirement removes known positions in arbitrary order, using the same index.
+        for (position, tag) in reference.iter_mut().enumerate().rev().step_by(2) {
+            if *tag > 0 {
+                index.remove(position as u32, *tag - 1).unwrap();
+                assert!(index.remove(position as u32, *tag - 1).is_err());
+                *tag = 0;
+            }
+        }
         for (position, &tag) in reference.iter().enumerate() {
             if tag > 0 {
                 assert_eq!(index.take(tag - 1, 0).unwrap(), position as u32);

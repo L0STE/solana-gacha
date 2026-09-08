@@ -9,17 +9,20 @@ import { compileTransactionMessage, getCompiledTransactionMessageEncoder } from 
 export type { Address, Instruction };
 export { Client } from './rpc.js';
 export const PROGRAM_ID = address('4X8u1YspRi6Z9TkZNb8qxNdwPLs5vDi7VRC2DhTheeKp');
+export const CORE_PROGRAM_ID = address('CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d');
 export const POOL_HEADER_LEN = 256;
 const TOKEN = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const SYSTEM = address('11111111111111111111111111111111');
 const ATA = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
 const MAX_U64 = (1n << 64n) - 1n;
+const POOL_STATUSES = ['paused', 'active', 'retired'] as const;
+export type PoolStatus = typeof POOL_STATUSES[number];
 const encoder = getAddressEncoder();
 const decoder = getAddressDecoder();
 
 export type ErrorCode = 'InvalidAccount' | 'InvalidArgument' | 'InvalidProof' | 'WrongPool'
   | 'NotPending' | 'NotSettled' | 'NotNextInQueue' | 'MissingInventory'
-  | 'InvalidItem' | 'TransactionTooLarge' | 'MissingAccount';
+  | 'InvalidItem' | 'InvalidAsset' | 'InvalidPoolStatus' | 'PendingPurchases' | 'TransactionTooLarge' | 'MissingAccount';
 export class GachaClientError extends Error {
   constructor(readonly code: ErrorCode) {
     super(code);
@@ -32,7 +35,8 @@ export enum GachaError {
   InvalidPoolParams, InvalidAuthority, InvalidOperator, InvalidTokenAddress,
   InvalidTier, InvalidItem, InvalidCount, NotNextInQueue, InvalidPullStatus,
   InvalidProof, SoldOut, DeadlineNotReached, InvalidOutcome, InsufficientBalance,
-  InvalidBuyer, DeadlinePassed, InventoryChanged,
+  InvalidBuyer, DeadlinePassed, InventoryChanged, InvalidQuote, QuoteExpired, InvalidAsset,
+  InvalidPoolStatus, PendingPurchases,
 }
 export interface Tier {
   readonly weight: number;
@@ -40,7 +44,7 @@ export interface Tier {
 }
 /** A null tier means the outcome has already been delivered. */
 export interface Outcome {
-  readonly mint: Address;
+  readonly asset: Address;
   readonly tier: number | null;
 }
 export interface Draw {
@@ -48,10 +52,36 @@ export interface Draw {
   readonly position: number;
   readonly item: Address;
 }
+/** Core ownership and collection header. Core validates full state on transfer. */
+export class Asset {
+  private constructor(readonly address: Address, readonly owner: Address, readonly collection: Address | null) { Object.freeze(this); }
+  static fromAccount(key: Address, owner: Address, data: Uint8Array): Asset {
+    if (owner !== CORE_PROGRAM_ID || data.length < 34 || data[0] !== 1) fail('InvalidAsset');
+    const kind = data[33]!;
+    if (kind > 2 || (kind !== 0 && data.length < 66)) fail('InvalidAsset');
+    return new Asset(address(key), keyAt(data, 1), kind === 2 ? keyAt(data, 34) : null);
+  }
+}
+
 export interface Buy {
   readonly buyer: Address;
   readonly count: number;
   readonly clientSeed: Uint8Array;
+}
+/** Reusable offer from the pool authority. Expiry is a Unix timestamp in seconds. */
+export interface BuybackQuote {
+  readonly pool: Address;
+  readonly asset: Address;
+  readonly price: bigint;
+  readonly expiresAt: bigint;
+  readonly tier: number;
+}
+
+/** Sign these bytes with the pool authority's Ed25519 key. */
+export function buybackMessage(quote: BuybackQuote): Uint8Array {
+  if (!integer(quote.tier, 0, 7) || quote.price <= 0n || quote.expiresAt <= 0n || quote.expiresAt > (1n << 63n) - 1n) fail('InvalidArgument');
+  return concat(new TextEncoder().encode('gacha:buyback:v1'), keyBytes(PROGRAM_ID),
+    keyBytes(quote.pool), keyBytes(quote.asset), u64(quote.price), u64(quote.expiresAt), Uint8Array.of(quote.tier));
 }
 /** Track pull after confirming instruction. Preparing is not buying. */
 export interface Purchase {
@@ -67,7 +97,7 @@ export interface CreatePool {
   readonly weights: readonly number[];
 }
 
-/** Create the vault and pool atomically. Authority pays ATA and pool rent. */
+/** Create the vault and paused pool atomically. Authority pays ATA and pool rent. */
 export async function createPoolInstructions(
   config: CreatePool,
   authority: Address,
@@ -129,6 +159,7 @@ export class Pool {
     const length = pool.#data.length;
     if (
       !integer(tierCount, 1, 8)
+      || pool.#data[3]! >= POOL_STATUSES.length
       || (length !== POOL_HEADER_LEN && length !== POOL_HEADER_LEN + inventorySpace(pool.inventoryVersion))
       || pool.price === 0n
       || pool.bondPerDraw === 0n
@@ -170,12 +201,38 @@ export class Pool {
   get nextIndex(): bigint { return readU64(this.#data, 176); }
   get nextSettle(): bigint { return readU64(this.#data, 184); }
   get inventoryVersion(): number { return readU32(this.#data, 4); }
+  get status(): PoolStatus { return POOL_STATUSES[this.#data[3]!]!; }
+
+  /** Authority controls admissions. Retirement is terminal; buyer exits stay open. */
+  setStatus(status: PoolStatus): Instruction {
+    const tag = POOL_STATUSES.indexOf(status);
+    if (tag < 0) fail('InvalidArgument');
+    if (this.status === 'retired' && status !== 'retired') fail('InvalidPoolStatus');
+    return ix(Uint8Array.of(3, tag), [ro(this.authority, true), rw(this.address)]);
+  }
   get tiers(): readonly Tier[] {
     const tiers = Array.from({ length: this.#data[2]! }, (_, i) => Object.freeze({
       weight: readU32(this.#data, 192 + 8 * i),
       remaining: readU32(this.#data, 196 + 8 * i),
     }));
     return Object.freeze(tiers);
+  }
+  /** Surplus after pending refunds. Supply this pool's current vault balance
+   * in raw payment-token units; execution rechecks the balance. */
+  spendableBalance(vaultBalance: bigint): bigint {
+    if (vaultBalance < 0n || vaultBalance > MAX_U64) fail('InvalidArgument');
+    const reserved = this.pendingDraws * (this.price + this.bondPerDraw);
+    if (reserved > MAX_U64) fail('InvalidAccount');
+    return vaultBalance > reserved ? vaultBalance - reserved : 0n;
+  }
+  /** Maximum draws given stock and collateral; zero unless the pool is active.
+   * Buyer funds, token restrictions and later state changes can still block it. */
+  availableDraws(vaultBalance: bigint): number {
+    if (this.status !== 'active') return 0;
+    const stock = this.tiers.reduce((sum, tier) => sum + BigInt(tier.remaining), 0n) - this.pendingDraws;
+    if (stock < 0n) fail('InvalidAccount');
+    const funded = this.spendableBalance(vaultBalance) / this.bondPerDraw;
+    return Math.min(10, Number(stock), Number(funded));
   }
   #tag(position: number): number {
     const block = Math.floor(position / 64);
@@ -184,6 +241,7 @@ export class Pool {
 
   /** Use a fresh random seed. Refetch and replace it if this snapshot goes stale. */
   async buy({ buyer, count, clientSeed }: Buy): Promise<Purchase> {
+    if (this.status !== 'active') fail('InvalidPoolStatus');
     if (!integer(count, 1, 10)) fail('InvalidArgument');
     const data = concat(Uint8Array.of(10, count), bytes(clientSeed, 32), u32(this.inventoryVersion));
     const pull = await Pull.addressFor(this.address, this.nextIndex);
@@ -199,21 +257,48 @@ export class Pool {
     return { pull, instruction: ix(data, accounts) };
   }
 
-  /** Create custody ATA if needed, then deposit. Submit these together. */
-  async deposit(tier: number, mint: Address): Promise<Instruction[]> {
+  /** Deposit an owned Core asset; the snapshot supplies its collection. */
+  async deposit(tier: number, asset: Asset): Promise<Instruction> {
+    if (this.status === 'retired') fail('InvalidPoolStatus');
     if (!integer(tier, 0, this.#data[2]! - 1)) fail('InvalidArgument');
-    const data = Uint8Array.of(1, tier);
-    const accounts = [
-      rw(this.authority, true),
-      rw(this.address),
+    if (asset.owner !== this.authority) fail('InvalidAsset');
+    return ix(Uint8Array.of(1, tier), [
+      rw(this.authority, true), rw(this.address),
       rw(await Item.addressFor(this.address, tier, this.inventoryVersion)),
-      ro(mint),
-      rw(await ata(this.authority, mint)),
-      rw(await ata(this.address, mint)),
-      ro(TOKEN),
-      ro(SYSTEM),
+      rw(asset.address), ro(asset.collection ?? CORE_PROGRAM_ID), ro(CORE_PROGRAM_ID), ro(SYSTEM),
+    ]);
+  }
+
+  /** Prepare atomic return/payment/restock, with payer funding account rent.
+   * Refetch and rebuild on an inventory race; the quote remains usable. */
+  async buyback(quote: BuybackQuote, signature: Uint8Array, asset: Asset, payer: Address = asset.owner): Promise<Instruction[]> {
+    if (this.status !== 'active') fail('InvalidPoolStatus');
+    const { pool, tier } = quote;
+    if (pool !== this.address) fail('WrongPool');
+    if (!integer(tier, 0, this.#data[2]! - 1)) fail('InvalidArgument');
+    if (quote.asset !== asset.address || asset.owner === pool) fail('InvalidAsset');
+    const message = buybackMessage(quote);
+    const data = concat(Uint8Array.of(12, tier), message.slice(112, 128), bytes(signature, 64));
+    const accounts = [
+      rw(payer, true), ro(asset.owner, true), rw(pool),
+      rw(await Item.addressFor(pool, tier, this.inventoryVersion)),
+      rw(asset.address), ro(asset.collection ?? CORE_PROGRAM_ID),
+      rw(this.vault), rw(await ata(asset.owner, this.paymentMint)),
+      ro(CORE_PROGRAM_ID), ro(TOKEN), ro(SYSTEM),
     ];
-    return [await createAta(this.authority, this.address, mint), ix(data, accounts)];
+    return [await createAta(payer, asset.owner, this.paymentMint), ix(data, accounts)];
+  }
+
+  /** Return an unsold asset and its Item rent to the authority after retirement.
+   * Pending purchases must resolve first; awarded Items cannot be reclaimed. */
+  reclaim(item: Item, asset: Asset): Instruction {
+    if (this.status !== 'retired') fail('InvalidPoolStatus');
+    if (this.pendingDraws !== 0n) fail('PendingPurchases');
+    if (item.pool !== this.address || item.tier >= this.#data[2]!
+      || item.position >= this.inventoryVersion || item.asset !== asset.address) fail('InvalidItem');
+    if (asset.owner !== this.address) fail('InvalidAsset');
+    return ix(Uint8Array.of(4), [rw(this.authority, true), rw(this.address), rw(item.address),
+      rw(asset.address), ro(asset.collection ?? CORE_PROGRAM_ID), ro(CORE_PROGRAM_ID), ro(SYSTEM)]);
   }
 
   withdraw(destination: Address, amount: bigint): Instruction {
@@ -228,9 +313,9 @@ export class Pool {
     return ix(data, accounts);
   }
 
-  /** The chain enforces the deadline. Prepend native ATA CreateIdempotent
-   * if the buyer's payment ATA may have been closed. */
-  async refund(pull: Pull): Promise<Instruction> {
+  /** Recreate the buyer's payment ATA if needed and refund atomically.
+   * Only payer signs; the chain enforces the deadline and collateral. */
+  async refund(pull: Pull, payer: Address): Promise<Instruction[]> {
     this.#pending(pull);
     const accounts = [
       rw(this.address),
@@ -240,7 +325,7 @@ export class Pool {
       rw(await ata(pull.buyer, this.paymentMint)),
       ro(TOKEN),
     ];
-    return ix(Uint8Array.of(11), accounts);
+    return [await createAta(payer, pull.buyer, this.paymentMint), ix(Uint8Array.of(11), accounts)];
   }
 
   #pending(pull: Pull): void {
@@ -333,20 +418,23 @@ export class Pull {
       const tier = this.#data[offset]!;
       return Object.freeze({
         tier: tier === 255 ? null : tier,
-        mint: keyAt(this.#data, offset + 1),
+        asset: keyAt(this.#data, offset + 1),
       });
     });
     return Object.freeze(outcomes);
   }
   /** Recovery only includes outcomes that remain undelivered. */
-  async deliver(payer: Address): Promise<Instruction[][]> {
-    const pending = [];
-    for (const [index, outcome] of this.outcomes().entries()) {
-      if (outcome.tier === null) continue;
-      pending.push(deliveryPair(this.pool, this.address, this.buyer, outcome.mint, index, payer));
-    }
-    return batches([], await Promise.all(pending), payer);
+  async deliver(assets: readonly Asset[], payer: Address): Promise<Instruction[][]> {
+    const pending = [...this.outcomes().entries()].filter(([, o]) => o.tier !== null);
+    if (pending.length !== assets.length) fail('InvalidAsset');
+    const instructions = pending.map(([i, outcome], n) => {
+      const asset = assets[n]!;
+      if (outcome.asset !== asset.address) fail('InvalidAsset');
+      return deliver(this.pool, this.address, this.buyer, asset, i, payer);
+    });
+    return batches([], instructions, payer);
   }
+
 }
 
 export class Item {
@@ -377,7 +465,7 @@ export class Item {
   get tier(): number { return this.#data[2]!; }
   get position(): number { return readU32(this.#data, 4); }
   get pool(): Address { return keyAt(this.#data, 8); }
-  get mint(): Address { return keyAt(this.#data, 40); }
+  get asset(): Address { return keyAt(this.#data, 40); }
 }
 
 /** Only exported as a type: obtain a plan through Pool.settle, never raw beta. */
@@ -407,18 +495,17 @@ class Settlement {
     ];
     return ix(data, accounts);
   }
-  async instructions(items: readonly Item[], payer: Address): Promise<Instruction[][]> {
-    if (
-      items.length !== this.#draws.length
-      || items.some((item, i) => item.address !== this.#draws[i]!.item)
-    ) {
-      fail('InvalidItem');
-    }
-    const pairs = await Promise.all(items.map((item, i) =>
-      deliveryPair(this.pool, this.pull, this.buyer, item.mint, i, payer),
-    ));
-    return batches([this.instruction()], pairs, payer);
+  async instructions(items: readonly Item[], assets: readonly Asset[], payer: Address): Promise<Instruction[][]> {
+    if (items.length !== this.#draws.length || items.some((item, i) => item.address !== this.#draws[i]!.item)) fail('InvalidItem');
+    if (assets.length !== items.length) fail('InvalidAsset');
+    const instructions = items.map((item, i) => {
+      const asset = assets[i]!;
+      if (item.asset !== asset.address) fail('InvalidAsset');
+      return deliver(this.pool, this.pull, this.buyer, asset, i, payer);
+    });
+    return batches([this.instruction()], instructions, payer);
   }
+
 }
 export type { Settlement };
 
@@ -481,32 +568,12 @@ function ro(key: Address, signer = false): AccountMeta {
   return { address: address(key), role };
 }
 function ix(data: Uint8Array, accounts: AccountMeta[]): Instruction { return { programAddress: PROGRAM_ID, data, accounts }; }
-async function deliver(
-  pool: Address,
-  pull: Address,
-  buyer: Address,
-  mint: Address,
-  outcome: number,
-): Promise<Instruction> {
-  const accounts = [
-    ro(pool),
-    rw(pull),
-    rw(buyer),
-    rw(await ata(pool, mint)),
-    rw(await ata(buyer, mint)),
-    ro(TOKEN),
-  ];
-  return ix(Uint8Array.of(21, outcome), accounts);
-}
-async function deliveryPair(
-  pool: Address,
-  pull: Address,
-  buyer: Address,
-  mint: Address,
-  outcome: number,
-  payer: Address,
-): Promise<[Instruction, Instruction]> {
-  return [await createAta(payer, buyer, mint), await deliver(pool, pull, buyer, mint, outcome)];
+function deliver(pool: Address, pull: Address, buyer: Address, asset: Asset, outcome: number, payer: Address): Instruction {
+  if (asset.owner !== pool) fail('InvalidAsset');
+  return ix(Uint8Array.of(21, outcome), [
+    rw(payer, true), ro(pool), rw(pull), rw(buyer), rw(asset.address),
+    ro(asset.collection ?? CORE_PROGRAM_ID), ro(CORE_PROGRAM_ID), ro(SYSTEM),
+  ]);
 }
 async function createAta(payer: Address, owner: Address, mint: Address): Promise<Instruction> {
   const accounts = [
@@ -523,14 +590,14 @@ function transactionSize(instructions: readonly Instruction[], payer: Address): 
   const message = compileTransactionMessage({ version: 'legacy', feePayer: { address: payer }, instructions });
   return 1 + message.header.numSignerAccounts * 64 + getCompiledTransactionMessageEncoder().encode(message).length;
 }
-function batches(initial: Instruction[], pairs: [Instruction, Instruction][], payer: Address): Instruction[][] {
+function batches(initial: Instruction[], instructions: Instruction[], payer: Address): Instruction[][] {
   const groups = [initial];
   if (transactionSize(initial, payer) > 1232) fail('TransactionTooLarge');
-  for (const pair of pairs) {
+  for (const instruction of instructions) {
     const current = groups.at(-1)!;
-    current.push(...pair);
+    current.push(instruction);
     if (transactionSize(current, payer) > 1232) {
-      const next = current.splice(-2);
+      const next = current.splice(-1);
       if (transactionSize(next, payer) > 1232) fail('TransactionTooLarge');
       groups.push(next);
     }

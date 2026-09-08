@@ -37,7 +37,7 @@ impl From<Error> for RpcError {
 /// cached state, background polling, or automatic seed/proof retries.
 ///
 /// ```no_run
-/// use gacha_program::client::{Buy, Client, RpcClient, RpcError};
+/// use gacha_rust::{Buy, Client, RpcClient, RpcError};
 /// use solana_pubkey::Pubkey;
 /// # async fn example(url: String, pool: Pubkey, buyer: Pubkey, seed: [u8; 32]) -> Result<(), RpcError> {
 /// let gacha = Client::new(RpcClient::new(url));
@@ -69,18 +69,55 @@ impl Client {
         let (_, accounts) = self.read(&[pool], None, Some(POOL_HEADER_LEN)).await?;
         Ok(Pool::from_account(pool, accounts[0].0, &accounts[0].1)?.buy(buy)?)
     }
-    /// Requires the buyer's payment ATA; prepend native ATA CreateIdempotent if needed.
-    pub async fn refund(&self, address: Pubkey) -> Result<Instruction, RpcError> {
-        let (pool, pull, _) = self.snapshot(address, false).await?;
-        Ok(pool.refund(&pull)?)
+    /// Prepare return, payment and restock from one current pool/asset read.
+    pub async fn buyback(
+        &self,
+        quote: &BuybackQuote,
+        signature: &[u8; 64],
+        payer: Pubkey,
+    ) -> Result<Vec<Instruction>, RpcError> {
+        let (_, accounts) = self
+            .read(&[quote.pool, quote.asset], None, Some(POOL_HEADER_LEN))
+            .await?;
+        let pool = Pool::from_account(quote.pool, accounts[0].0, &accounts[0].1)?;
+        let asset = Asset::from_account(quote.asset, accounts[1].0, &accounts[1].1)?;
+        Ok(pool.buyback(quote, signature, &asset, payer)?)
     }
-    /// Resume delivery of the recorded outcomes, without a proof or inventory read.
+
+    pub async fn fetch_asset(&self, address: Pubkey) -> Result<Asset, RpcError> {
+        Ok(self.assets(&[address], None).await?.remove(0))
+    }
+
+    pub async fn fetch_item(&self, address: Pubkey) -> Result<Item, RpcError> {
+        let (_, accounts) = self.read(&[address], None, None).await?;
+        Ok(Item::from_account(address, accounts[0].0, &accounts[0].1)?)
+    }
+
+    /// Prepare payment ATA creation and refund together; payer funds any rent.
+    pub async fn refund(
+        &self,
+        address: Pubkey,
+        payer: Pubkey,
+    ) -> Result<Vec<Instruction>, RpcError> {
+        let (pool, pull, _) = self.snapshot(address, false).await?;
+        Ok(pool.refund(&pull, payer)?)
+    }
+    /// Resume the recorded outcomes, fetching ownership and collection headers.
     pub async fn deliver(
         &self,
         address: Pubkey,
         payer: Pubkey,
     ) -> Result<Vec<Vec<Instruction>>, RpcError> {
-        Ok(self.fetch_pull(address).await?.deliver(payer)?)
+        let (slot, accounts) = self.read(&[address], None, None).await?;
+        let pull = Pull::from_account(address, accounts[0].0, &accounts[0].1)?;
+        let keys: Vec<_> = pull
+            .outcomes()?
+            .iter()
+            .filter(|o| o.tier.is_some())
+            .map(|o| o.asset)
+            .collect();
+        let assets = self.assets(&keys, Some(slot)).await?;
+        Ok(pull.deliver(&assets, payer)?)
     }
     /// Fetch one coherent pool/pull snapshot, verify, then fetch exactly the
     /// selected items at least as recently. Returns ordered instruction groups.
@@ -93,13 +130,25 @@ impl Client {
         let (pool, pull, slot) = self.snapshot(address, true).await?;
         let plan = pool.settle(&pull, proof)?;
         let keys: Vec<_> = plan.draws().iter().map(|draw| draw.item).collect();
-        let (_, accounts) = self.read(&keys, Some(slot), None).await?;
-        let items = keys
+        let (slot, accounts) = self.read(&keys, Some(slot), None).await?;
+        let items: Vec<_> = keys
             .iter()
             .zip(accounts)
             .map(|(key, (owner, data))| Item::from_account(*key, owner, &data))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(plan.instructions(&items, payer)?)
+        let keys: Vec<_> = items.iter().map(Item::asset).collect();
+        let assets = self.assets(&keys, Some(slot)).await?;
+        Ok(plan.instructions(&items, &assets, payer)?)
+    }
+    async fn assets(&self, keys: &[Pubkey], minimum: Option<u64>) -> Result<Vec<Asset>, RpcError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, accounts) = self.read(keys, minimum, Some(66)).await?;
+        keys.iter()
+            .zip(accounts)
+            .map(|(key, (owner, data))| Ok(Asset::from_account(*key, owner, &data)?))
+            .collect()
     }
     async fn snapshot(
         &self,
@@ -160,126 +209,5 @@ impl Client {
             })
             .collect::<Result<Vec<_>, RpcError>>()?;
         Ok((response.context.slot, accounts))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use serde_json::{json, Value};
-    use solana_rpc_client::api::request::RpcRequest;
-
-    fn data(a: &Value) -> Vec<u8> {
-        a["data"]
-            .as_str()
-            .unwrap()
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|s| u8::from_str_radix(std::str::from_utf8(s).unwrap(), 16).unwrap())
-            .collect()
-    }
-    fn key(a: &Value) -> Pubkey {
-        a["address"].as_str().unwrap().parse().unwrap()
-    }
-    fn response(slot: u64, accounts: &[&Value]) -> Value {
-        json!({"context": {"slot": slot}, "value": accounts.iter().map(|a| if a.is_null() { Value::Null } else {
-            json!({"owner": a["owner"], "data": [STANDARD.encode(data(a)), "base64"],
-                "lamports": 1, "executable": false, "rentEpoch": 0, "space": data(a).len()})
-        }).collect::<Vec<_>>()})
-    }
-    fn client(responses: Vec<Value>) -> Client {
-        Client::new(RpcClient::new_mock_with_mocks_map(
-            "succeeds",
-            responses
-                .into_iter()
-                .map(|r| (RpcRequest::GetMultipleAccounts, r))
-                .collect(),
-        ))
-    }
-
-    #[tokio::test]
-    async fn rpc_composes_and_recovers_without_sending() {
-        let v: Value = serde_json::from_str(include_str!("test-vector.json")).unwrap();
-        let pool = key(&v["pool"]);
-        let pull = key(&v["pull"]);
-        let payer: Pubkey = v["operator"].as_str().unwrap().parse().unwrap();
-        let buyer = v["buyer"].as_str().unwrap().parse().unwrap();
-        let proof = Proof(data(&json!({"data": v["proof"]})).try_into().unwrap());
-        let purchase = client(vec![response(10, &[&v["beforeBuy"]])])
-            .buy(
-                pool,
-                Buy {
-                    buyer,
-                    count: 10,
-                    client_seed: [7; 32],
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(purchase.pull, pull);
-        let items: Vec<_> = v["items"].as_array().unwrap().iter().collect();
-        let rpc = client(vec![
-            response(10, &[&v["pull"]]),
-            response(11, &[&v["pool"], &v["pull"]]),
-            response(12, &items),
-        ]);
-        let groups = rpc.settle(pull, &proof, payer).await.unwrap();
-        let pool = Pool::from_account(pool, PROGRAM_ID, &data(&v["pool"])).unwrap();
-        let pending = Pull::from_account(pull, PROGRAM_ID, &data(&v["pull"])).unwrap();
-        let items: Vec<_> = items
-            .iter()
-            .map(|a| Item::from_account(key(a), PROGRAM_ID, &data(a)).unwrap())
-            .collect();
-        assert_eq!(
-            groups,
-            pool.settle(&pending, &proof)
-                .unwrap()
-                .instructions(&items, payer)
-                .unwrap()
-        );
-        // The RPC's shared data slice must retain the complete Pull. The Pool
-        // response may end mid-inventory block; refunds decode only its header.
-        let mut sliced_pool = v["pool"].clone();
-        let mut pool_data = data(&sliced_pool);
-        pool_data.resize(PULL_LEN, 0);
-        sliced_pool["data"] = json!(pool_data
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>());
-        let refund = client(vec![
-            response(10, &[&v["pull"]]),
-            response(11, &[&sliced_pool, &v["pull"]]),
-        ])
-        .refund(pull)
-        .await
-        .unwrap();
-        assert_eq!(refund, pool.refund(&pending).unwrap());
-        sliced_pool["data"] = json!("00".repeat(POOL_HEADER_LEN - 1));
-        assert!(matches!(
-            client(vec![
-                response(10, &[&v["pull"]]),
-                response(11, &[&sliced_pool, &v["pull"]]),
-            ])
-            .refund(pull)
-            .await,
-            Err(RpcError::Account(Error::InvalidAccount))
-        ));
-        let remaining = client(vec![response(20, &[&v["partialPull"]])])
-            .deliver(pull, payer)
-            .await
-            .unwrap();
-        assert_eq!(remaining, groups[1..]);
-        let stale = client(vec![
-            response(10, &[&v["pull"]]),
-            response(9, &[&v["pool"], &v["pull"]]),
-        ]);
-        assert!(matches!(
-            stale.settle(pull, &proof, payer).await,
-            Err(RpcError::Account(Error::InvalidAccount))
-        ));
-        assert!(
-            matches!(client(vec![response(10, &[&Value::Null])]).fetch_pull(pull).await, Err(RpcError::MissingAccount(a)) if a == pull)
-        );
     }
 }

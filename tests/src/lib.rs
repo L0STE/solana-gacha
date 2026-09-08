@@ -1,20 +1,23 @@
-//! Test fixture: a Mollusk instance with the gacha and token programs, and
+//! Test fixture: a Mollusk instance with the gacha, Core and token programs, and
 //! builders for every instruction. The `Model` mirrors the on-chain draw so a
 //! test can know which item accounts a settle needs, exactly as an operator
 //! backend does.
 
-use gacha_program::test_utils::*;
+use gacha_core::constants::*;
 use mollusk_svm::{program::keyed_account_for_system_program, result::InstructionResult, Mollusk};
 use solana_account::Account;
 use solana_ecvrf::{PublicKey, SecretKey};
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
-pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_program::ID);
+pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_core::ID);
+pub const CORE: Pubkey = gacha_rust::CORE_PROGRAM_ID;
 pub const TOKEN: Pubkey = mollusk_svm_programs_token::token::ID;
 pub const ATA_PROGRAM: Pubkey =
     solana_pubkey::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const SYSTEM: Pubkey = Pubkey::new_from_array([0; 32]);
+
+pub const AUTHORITY_SEED: [u8; 32] = [7; 32];
 
 pub const PRICE: u64 = 5_000_000;
 pub const BOND_PER_DRAW: u64 = 1_000_000;
@@ -84,6 +87,24 @@ pub fn mint_account(supply: u64) -> Account {
     }
 }
 
+/// A complete uncompressed Core AssetV1 with empty metadata and no plugins.
+pub fn core_asset(owner: &Pubkey, collection: Option<&Pubkey>) -> Account {
+    let mut data = vec![1];
+    data.extend(owner.as_ref());
+    data.push(if collection.is_some() { 2 } else { 0 });
+    if let Some(collection) = collection {
+        data.extend(collection.as_ref());
+    }
+    data.extend([0; 9]); // empty name, empty URI, no sequence number
+    Account {
+        lamports: 2_000_000,
+        data,
+        owner: CORE,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
 pub fn wallet(lamports: u64) -> Account {
     Account {
         lamports,
@@ -143,14 +164,14 @@ impl Model {
             .enumerate()
             .filter_map(|(position, item)| {
                 item.filter(|(t, _)| *t == tier)
-                    .map(|(_, mint)| (position, mint))
+                    .map(|(_, asset)| (position, asset))
             })
             .collect();
         let rank = (u64::from_le_bytes(hash[8..16].try_into().unwrap()) % candidates.len() as u64)
             as usize;
-        let (position, mint) = candidates[rank];
+        let (position, asset) = candidates[rank];
         self.items[position] = None;
-        Some((tier, position as u32, mint))
+        Some((tier, position as u32, asset))
     }
 }
 
@@ -175,10 +196,15 @@ impl Fixture {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../target/deploy"),
         );
         let mut mollusk = Mollusk::new(&PROGRAM_ID, "gacha_program");
+        mollusk.add_program(&CORE, "mpl_core_program");
         mollusk_svm_programs_token::token::add_program(&mut mollusk);
         mollusk_svm_programs_token::associated_token::add_program(&mut mollusk);
 
-        let authority = Pubkey::new_unique();
+        let authority = Pubkey::new_from_array(
+            ed25519_dalek::SigningKey::from_bytes(&AUTHORITY_SEED)
+                .verifying_key()
+                .to_bytes(),
+        );
         let operator_key = SecretKey([9u8; 32]);
         let operator = Pubkey::new_from_array(operator_key.public_key().0);
         let buyer = Pubkey::new_unique();
@@ -202,6 +228,10 @@ impl Fixture {
             ),
             (pool, wallet(0)),
             keyed_account_for_system_program(),
+            (
+                CORE,
+                mollusk_svm::program::create_program_account_loader_v3(&CORE),
+            ),
             mollusk_svm_programs_token::token::keyed_account(),
             mollusk_svm_programs_token::associated_token::keyed_account(),
         ];
@@ -289,34 +319,37 @@ impl Fixture {
         self.account(&self.pool).data.clone()
     }
 
-    pub fn client_pool(&self) -> gacha_program::client::Pool {
+    pub fn client_pool(&self) -> gacha_rust::Pool {
         let account = self.account(&self.pool);
-        gacha_program::client::Pool::from_account(self.pool, account.owner, &account.data).unwrap()
+        gacha_rust::Pool::from_account(self.pool, account.owner, &account.data).unwrap()
     }
 
-    pub fn client_pull(&self, pull: &Pubkey) -> gacha_program::client::Pull {
+    pub fn client_pull(&self, pull: &Pubkey) -> gacha_rust::Pull {
         let account = self.account(pull);
-        gacha_program::client::Pull::from_account(*pull, account.owner, &account.data).unwrap()
+        gacha_rust::Pull::from_account(*pull, account.owner, &account.data).unwrap()
     }
 
-    pub fn client_settlement(&self, pull: &Pubkey) -> gacha_program::client::Settlement {
+    pub fn client_asset(&self, key: Pubkey) -> gacha_rust::Asset {
+        let account = self.account(&key);
+        gacha_rust::Asset::from_account(key, account.owner, &account.data).unwrap()
+    }
+
+    pub fn client_settlement(&self, pull: &Pubkey) -> gacha_rust::Settlement {
         let pull = self.client_pull(pull);
         let proof = self.operator_key.prove(&pull.alpha());
         self.client_pool().settle(&pull, &proof).unwrap()
     }
 
-    pub fn client_items(
-        &self,
-        settlement: &gacha_program::client::Settlement,
-    ) -> Vec<gacha_program::client::Item> {
+    pub fn client_item(&self, key: Pubkey) -> gacha_rust::Item {
+        let account = self.account(&key);
+        gacha_rust::Item::from_account(key, account.owner, &account.data).unwrap()
+    }
+
+    pub fn client_items(&self, settlement: &gacha_rust::Settlement) -> Vec<gacha_rust::Item> {
         settlement
             .draws()
             .iter()
-            .map(|draw| {
-                let account = self.account(&draw.item);
-                gacha_program::client::Item::from_account(draw.item, account.owner, &account.data)
-                    .unwrap()
-            })
+            .map(|draw| self.client_item(draw.item))
             .collect()
     }
 
@@ -350,8 +383,19 @@ impl Fixture {
         )
     }
 
-    pub fn create_pool(&mut self) -> InstructionResult {
-        self.run(&self.create_pool_ix())
+    /// Bootstrap an active pool for flow tests; lifecycle tests create it explicitly.
+    pub fn open_pool(&mut self) -> InstructionResult {
+        let result = self.run(&self.create_pool_ix());
+        if result.program_result.is_ok() {
+            self.run(
+                &self
+                    .client_pool()
+                    .set_status(gacha_rust::PoolStatus::Active)
+                    .unwrap(),
+            )
+        } else {
+            result
+        }
     }
 
     /// Mint a fresh NFT to the authority and deposit it into `tier`.
@@ -365,13 +409,8 @@ impl Fixture {
     }
 
     pub fn deposit_ix(&mut self, tier: u8) -> Instruction {
-        let mint = Pubkey::new_unique();
-        self.upsert(mint, mint_account(1));
-        self.upsert(
-            ata(&self.authority, &mint),
-            token_account(&mint, &self.authority, 1),
-        );
-        self.upsert(ata(&self.pool, &mint), token_account(&mint, &self.pool, 0));
+        let asset = Pubkey::new_unique();
+        self.upsert(asset, core_asset(&self.authority, None));
         let position = self.model.items.len() as u32;
         let data = [1u8, tier];
         Instruction::new_with_bytes(
@@ -381,10 +420,9 @@ impl Fixture {
                 AccountMeta::new(self.authority, true),
                 AccountMeta::new(self.pool, false),
                 AccountMeta::new(item_pda(&self.pool, tier, position), false),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(ata(&self.authority, &mint), false),
-                AccountMeta::new(ata(&self.pool, &mint), false),
-                AccountMeta::new_readonly(TOKEN, false),
+                AccountMeta::new(asset, false),
+                AccountMeta::new_readonly(CORE, false),
+                AccountMeta::new_readonly(CORE, false),
                 AccountMeta::new_readonly(SYSTEM, false),
             ],
         )
@@ -419,7 +457,7 @@ impl Fixture {
     }
 
     /// The operator's job: prove, walk the model, pass the item accounts.
-    /// Returns the instruction and the expected `(tier, mint)` outcomes.
+    /// Returns the instruction and the expected `(tier, asset)` outcomes.
     pub fn settle_ix(&self, pull: &Pubkey, model: &mut Model) -> (Instruction, Vec<(u8, Pubkey)>) {
         let pull_account = self.account(pull);
         let count = pull_account.data[3] as usize;
@@ -440,14 +478,14 @@ impl Fixture {
         for i in 0..count {
             let hash = solana_sha256_hasher::hashv(&[&beta, &[i as u8]]).to_bytes();
             // A sold-out pool has no item to pass; the program rejects the settle.
-            let Some((tier, position, mint)) = model.draw(&hash, cutoff) else {
+            let Some((tier, position, asset)) = model.draw(&hash, cutoff) else {
                 break;
             };
             metas.push(AccountMeta::new(
                 item_pda(&self.pool, tier, position),
                 false,
             ));
-            outcomes.push((tier, mint));
+            outcomes.push((tier, asset));
         }
         let mut data = vec![20u8];
         data.extend(proof.0);

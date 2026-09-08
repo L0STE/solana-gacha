@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["program", "tests"]
+members = ["program", "packages/gacha-core", "packages/gacha-rust", "tests"]
 
 [workspace.dependencies]
-gacha-program = { path = "program" }
+gacha-core = { path = "packages/gacha-core", version = "0.0.1" }
+gacha-rust = { path = "packages/gacha-rust", version = "0.0.1" }
+pinocchio = { version = "=0.8.4", default-features = false }
 solana-ecvrf = "0.0.1"
 
 # Financial boundaries use checked arithmetic as well as runtime overflow checks.

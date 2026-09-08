@@ -1,11 +1,13 @@
 //! CU benches; `cargo bench -p gacha-tests` regenerates `benches/compute_units.md`.
 
+use ed25519_dalek::{Signer, SigningKey};
+use gacha_rust::BuybackQuote;
 use gacha_tests::*;
 use mollusk_svm_bencher::MolluskComputeUnitBencher;
 
 fn main() {
     let mut f = Fixture::new();
-    f.create_pool();
+    f.open_pool();
     for tier in 0..3 {
         for _ in 0..4 {
             f.deposit(tier);
@@ -16,7 +18,35 @@ fn main() {
     f.ensure(&settle1);
     let accounts1 = f.accounts.clone();
     // Settle the single pull so a ten-pull can be set up behind it.
-    f.settle(&pull1);
+    assert!(f.settle(&pull1).0.program_result.is_ok());
+    let asset = f.client_pull(&pull1).outcomes().unwrap()[0].asset;
+    let deliver = f
+        .client_pull(&pull1)
+        .deliver(&[f.client_asset(asset)], f.operator)
+        .unwrap()
+        .remove(0)
+        .remove(0);
+    f.ensure(&deliver);
+    let accounts_deliver = f.accounts.clone();
+    assert!(f.run(&deliver).program_result.is_ok());
+    let quote = BuybackQuote {
+        pool: f.pool,
+        asset,
+        price: PRICE,
+        expires_at: 300,
+        tier: 0,
+    };
+    let signature = SigningKey::from_bytes(&AUTHORITY_SEED)
+        .sign(&quote.message())
+        .to_bytes();
+    let buyback = f
+        .client_pool()
+        .buyback(&quote, &signature, &f.client_asset(asset), f.operator)
+        .unwrap()
+        .pop()
+        .unwrap();
+    f.ensure(&buyback);
+    let accounts_buyback = f.accounts.clone();
     let (pull10, _) = f.buy(10, [2; 32]);
     let (settle10, _) = f.settle_ix(&pull10, &mut f.model.clone());
     f.ensure(&settle10);
@@ -41,6 +71,8 @@ fn main() {
 
     MolluskComputeUnitBencher::new(f.mollusk)
         .bench(("buy", &buy, &accounts_buy))
+        .bench(("deliver_core", &deliver, &accounts_deliver))
+        .bench(("buyback_core", &buyback, &accounts_buyback))
         .bench(("settle_1", &settle1, &accounts1))
         .bench(("settle_10", &settle10, &accounts10))
         .bench((

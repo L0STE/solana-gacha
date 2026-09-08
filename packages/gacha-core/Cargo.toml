@@ -1,0 +1,10 @@
+[package]
+name = "gacha-core"
+version = "0.0.1"
+edition = "2021"
+description = "Shared account layouts, error codes and draw rules for Solana Gacha"
+license = "MIT"
+repository = "https://github.com/L0STE/solana-gacha"
+
+[dependencies]
+pinocchio = { workspace = true }

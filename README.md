@@ -1,8 +1,8 @@
 # Solana Gacha
 
-A continuously stocked gacha for Solana: 1–10 draws per purchase, weighted prize
-tiers, on-chain ECVRF verification, and funded timeout refunds. Prizes stay in
-ordinary SPL token accounts until delivered to the buyer.
+A continuously stocked Metaplex Core NFT gacha for Solana: 1–10 draws per purchase, weighted prize
+tiers, on-chain ECVRF verification, and funded timeout refunds. The pool PDA owns each
+Core asset until delivery; legacy SPL tokens handle payments and refunds.
 
 ## How it works
 
@@ -21,32 +21,57 @@ The program verifies the proof before deriving any draw. For each draw,
 relative weight, then a remaining item uniformly by rank. Purchases settle or
 refund in FIFO order. Delivery always goes to the recorded buyer.
 
-Settlement, buyer ATA creation, and delivery can share a transaction. Larger
-purchases split into ordered transactions; recorded awards remain claimable if
+Settlement and Core delivery can share a transaction. The SDK splits batches
+when needed to fit the transaction limit; recorded awards remain claimable if
 delivery is interrupted. The final delivery closes the Pull account and returns
 its rent to the buyer.
 
 ## This implementation
 
-The program uses Pinocchio, no on-chain heap allocation, and native SPL custody.
+The program uses Pinocchio, no on-chain heap allocation, and native Core transfers.
 The Rust and TypeScript clients derive accounts, validate snapshots, verify
 proofs, and compose ordinary instructions. They do not hold wallet keys or send
 transactions.
 
+The [program](program), [Kit SDK](packages/gacha-kit), and
+[Rust SDK](packages/gacha-rust) are separate packages. The program and Rust SDK
+share layouts and draw rules through [gacha-core](packages/gacha-core), which
+is `no_std` and allocation-free.
+
 | State | Responsibility |
 |---|---|
-| Pool | Fixed price, tier weights, operator, deadlines, queue, availability index |
-| Item | Immutable mint, tier, and global deposit position; closed at settlement |
+| Pool | Lifecycle, fixed price, tier weights, operator, deadlines, queue, availability index |
+| Item | Immutable Core asset address, tier, and global deposit position; closed at settlement or reclamation |
 | Pull | Buyer, committed seed/version, deadline, and recorded delivery progress |
+
+### Open, pause, and retire
+
+New pools start **paused** so the authority can stock them before opening sales.
+Only the authority can change their status.
+
+| Status | Buy / buyback | Deposit | Reclaim unsold NFTs |
+|---|---|---|---|
+| Paused | Blocked | Allowed | Blocked |
+| Active | Allowed | Allowed | Blocked |
+| Retired | Blocked | Blocked | After all pending purchases resolve |
+
+Pausing is reversible; retirement is permanent. Settlement, delivery, timeout
+refunds, and surplus withdrawals remain available in every state. Retirement
+does not cancel purchases or release their refund reserves.
+
+After retirement and an empty pending queue, the authority can reclaim each
+unsold NFT and its Item rent in one instruction. Awarded NFTs remain reserved
+for their buyers. The Pool stays alive for delivery, and its index rent remains
+locked; reclaiming inventory does not compact or close it.
 
 ### Restock without changing earlier purchases
 
 Each deposit gets a permanent position and increments `inventory_version`.
 A purchase is eligible only for positions below its signed version. New stock
 immediately serves new purchases, even while older purchases are pending; it
-never enters their candidate sets. A position's mint and tier cannot change,
+never enters their candidate sets. A position's asset and tier cannot change,
 and positions are never reused. A returned prize can be deposited again at a
-new position; its mint stays the same.
+new position; its asset address stays the same.
 
 Earlier FIFO winners still consume shared candidates, so a pinned candidate
 list is not a promise that every candidate remains available. Empty eligible
@@ -57,6 +82,22 @@ rank selection uses a Fenwick index, without scanning historical winners or
 requiring copied snapshot accounts. The index is append-only: pool rent and
 account loading grow with its history; there is no compaction or pool-close
 instruction. Host clients currently scan the index to prepare settlement.
+
+### Buyback and restock
+
+The pool authority can sign `{ pool, asset, price, expires_at, tier }` to offer a
+buyback in the pool's payment token. The service sets expiry five minutes ahead;
+the program checks the signed Unix timestamp against `Clock`. Quotes are open to
+any holder and reusable until expiry. Every payout requires returning the prize.
+
+Buyback transfers the prize, appends a fresh inventory position, and pays the
+seller atomically. It spends only surplus above all pending refund obligations;
+a quote does not reserve liquidity. No receipt accounts or quote IDs are created.
+Brine verifies the authority's Ed25519 signature over the SDK's canonical message,
+bound to this program and the `gacha:buyback:v1` domain. The SDK prepares the
+seller's payment ATA and buyback together, with a separate rent payer when the
+application sponsors the transaction. An inventory race requires
+refetching and rebuilding the transaction, without obtaining a new signature.
 
 ### What verification does—and does not—guarantee
 
@@ -77,22 +118,29 @@ account rent, proof generation, and RPC infrastructure still have costs.
 
 ### Asset assumptions
 
-Each prize is one raw unit of a legacy SPL token. The program does not validate
-NFT supply, decimals, metadata, or mint/freeze authorities. Applications choose
-which mints to admit; NFT prizes need those properties checked separately.
+Prizes must be uncompressed Metaplex Core `AssetV1` accounts. Deposits and
+buybacks require the current owner to authorize the transfer. Delivery transfers
+ownership from the pool PDA to the recorded buyer. SPL and Token-2022 prizes,
+Token Metadata NFTs, compressed assets, and collection accounts are not prizes.
 
-Delivery and refunds require transferable tokens. A retained freeze authority
-can block prize delivery or payment-vault refunds; collateral does not bypass
-SPL restrictions. Admit prizes with revoked freeze authority or explicitly trust
-their issuer, and assess payment-token issuer controls too. A settled award has
-no timeout refund, even if its token later becomes frozen.
+Collection membership is read from the asset, and Core enforces its transfer
+rules and applicable plugins. This integration uses standard `TransferV1`
+accounts; external adapters requiring additional accounts are unsupported.
+
+Core ownership alone does not remove issuer controls. Permanent transfer/burn
+delegates and asset or collection freeze rules can remove custody or block
+later delivery. The pool authority must assess those controls before admitting
+an asset or signing a buyback. A settled award has no timeout refund. Payment
+tokens also need transferable vaults: retained SPL freeze authority can block
+refunds despite the reserved balance.
 
 ## Tests and verification
 
-Mollusk tests execute the compiled program, including collateral boundaries,
-FIFO settlement, restocking, stale purchases, native ATA composition, and atomic
-rollback. A Rust-generated flow pins TypeScript instructions, proof selection,
-and packet boundaries to the same bytes. Both clients also test RPC reads and
+Mollusk tests execute the compiled gacha and published Core programs, covering
+collateral boundaries, FIFO settlement, restocking, stale purchases, Core custody,
+buybacks, retirement, unsold reclamation, payment ATA composition, and atomic rollback. A Rust-generated flow
+pins TypeScript instructions, proof selection, and packet boundaries to the same
+bytes. Both clients also test RPC reads and
 recovery after partial delivery.
 
 Requires Rust, Bun, cargo-build-sbf 4.x, and platform-tools v1.53 or newer.
@@ -101,17 +149,23 @@ The workspace consumes the published `solana-ecvrf` crate and
 
 ```sh
 cargo-build-sbf --manifest-path program/Cargo.toml --tools-version v1.53
-RUST_LOG=error cargo test --workspace --features gacha-program/rpc -- --test-threads=1
-cargo clippy --workspace --all-targets --features gacha-program/rpc -- -D warnings
+curl -fL 'https://github.com/metaplex-foundation/mpl-core/releases/download/release/core%400.15.2/mpl_core_program.so' -o target/deploy/mpl_core_program.so
+RUST_LOG=error cargo test --workspace -- --test-threads=1
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 bun install --frozen-lockfile
 bun run test
 ```
 
-Recorded local compute measurements: Buy **5,492 CU**, one-draw settlement
-**12,895 CU**, ten-draw settlement **18,968 CU**. A ten-draw purchase pinned at
-511 deposit positions, with 65 later deposits, uses **25,348 CU**. These exclude
-composed ATA creation/delivery; see [the benchmark log](tests/benches/compute_units.md).
+The Core test binary is release `core@0.15.2`; its SHA-256 is
+`69be69672220f4b5b0813e53cc4e2f3042dcac991f088b174bc7907dab4b2dee`.
+
+Recorded local compute measurements: Buy **5,537 CU**, one-draw settlement
+**12,654 CU**, ten-draw settlement **18,169 CU**. A ten-draw purchase pinned at
+511 deposit positions, with 65 later deposits, uses **25,983 CU**. Core delivery
+uses **6,112 CU** and buyback **25,441 CU** for standalone assets without plugins.
+These are individual instructions and exclude payment ATA creation; collection
+and plugin rules add cost. See [the benchmark log](tests/benches/compute_units.md).
 
 The ECVRF dependency requires the feature-gated `sol_sha512` syscall. Check
 activation on the deployment cluster. Passing local tests is not evidence of
@@ -119,11 +173,11 @@ mainnet compatibility or a production deployment.
 
 ## TypeScript: buy and track a pull
 
-Import `@blueshift-gg/gacha` from this Bun workspace. It uses Solana Kit
+Import `@blueshift-gg/gacha-kit` from this Bun workspace. It uses Solana Kit
 instructions and accepts an existing RPC transport.
 
 ```ts
-import { Client } from '@blueshift-gg/gacha';
+import { Client } from '@blueshift-gg/gacha-kit';
 import { createSolanaRpc } from '@solana/rpc';
 
 const gacha = new Client(createSolanaRpc(rpcUrl));
@@ -156,26 +210,25 @@ const remaining = await gacha.deliver(pullAddress, feePayerAddress);
 ```
 
 `settle` reads a coherent pool/pull snapshot, verifies the proof, and fetches only
-the selected Item accounts at a context slot no older than that snapshot. The
+the selected Item accounts, then their Core ownership/collection headers, at
+context slots no older than each preceding read. The
 proof can be published for any relayer to submit. `deliver` needs no proof or
-inventory read; `refund(pullAddress)` builds the timeout refund instruction.
-If the buyer closed their payment ATA, prepend the SPL Associated Token
-program's `CreateIdempotent` instruction for `(buyer, paymentMint)`. Submit both
-in one transaction: a relayer pays ATA rent, and the buyer need not sign. This
-composition is safe when the ATA already exists and applies to both clients.
+inventory read. `refund(pullAddress, feePayerAddress)` prepares payment ATA
+creation and the timeout refund together. Submit both instructions in one
+transaction; the payer covers any account rent and the buyer need not sign.
 
 ## Rust: the same flow
 
-The host client lives in `gacha_program::client`. RPC is opt-in; omitting `rpc`
+The host client lives in `gacha_rust`. RPC is opt-in; omitting `rpc`
 keeps the HTTP client and async runtime out of the core dependency graph.
 
 ```toml
 [dependencies]
-gacha-program = { path = "path/to/solana-gacha/program", features = ["rpc"] }
+gacha-rust = { path = "path/to/solana-gacha/packages/gacha-rust", features = ["rpc"] }
 ```
 
 ```rust
-use gacha_program::client::{Buy, Client, RpcClient};
+use gacha_rust::{Buy, Client, RpcClient};
 
 let gacha = Client::new(RpcClient::new(rpc_url));
 let purchase = gacha.buy(pool_address, Buy {
@@ -197,20 +250,72 @@ to `confirmed`; pass `'finalized'` as the second `Client` constructor argument
 when required. Neither client caches state, polls, retries purchases, or submits
 transactions automatically.
 
+### Prepare a buyback
+
+The backend signs `buybackMessage(quote)` in TypeScript or `quote.message()` in
+Rust with the pool authority's Ed25519 key. `asset` is the Core asset address;
+`price` is in raw payment-token units and `expiresAt` / `expires_at` is a Unix
+timestamp in seconds, normally the backend's current time plus 300.
+
+```ts
+const instructions = await gacha.buyback(quote, signature, rentPayerAddress);
+```
+
+```rust
+let instructions = gacha.buyback(&quote, &signature, rent_payer).await?;
+```
+
+Both clients fetch the current holder and collection automatically. The holder
+signs the return and receives payment; the payer signs to fund account rent.
+They can be the same wallet. Submit the returned instructions together.
+
 ### Inventory management and offline use
 
-Fetch a Pool with `fetchPool` / `fetch_pool`. Its `deposit(tier, mint)` returns
-ATA creation plus deposit, ready to submit together; `withdraw(destination,
-amount)` builds a surplus withdrawal to a token account. Create a pool with
+Fetch a Pool with `fetchPool` / `fetch_pool` and a Core Asset with `fetchAsset` /
+`fetch_asset`. `pool.deposit(tier, asset)` returns one deposit instruction; the
+asset supplies its owner and collection. `withdraw(destination, amount)` builds
+a surplus withdrawal to a payment token account. Create a pool with
 `createPoolInstructions` in TypeScript or `CreatePool::instructions` in Rust;
-both include vault creation. The authority must already hold the funding tokens
-or prize in its corresponding ATA. Custody uses the legacy SPL Token program.
+both include payment-vault creation. The authority must own the Core prize and
+hold the funding tokens in its payment ATA.
+
+After stocking, submit `pool.setStatus('active')` in TypeScript or
+`pool.set_status(PoolStatus::Active)?` in Rust. Use `paused` / `Paused` to suspend
+sales and `retired` / `Retired` to end them permanently. Both require the authority's
+signature. Once retirement is confirmed and `pendingDraws` / `pending_draws()`
+is zero, fetch a live unsold Item to reclaim it:
+
+```ts
+const pool = await gacha.fetchPool(poolAddress);
+const item = await gacha.fetchItem(itemAddress);
+const asset = await gacha.fetchAsset(item.asset);
+const instruction = pool.reclaim(item, asset);
+```
+
+```rust
+let pool = gacha.fetch_pool(pool_address).await?;
+let item = gacha.fetch_item(item_address).await?;
+let asset = gacha.fetch_asset(item.asset()).await?;
+let instruction = pool.reclaim(&item, &asset)?;
+```
+
+The authority signs reclamation and receives both the NFT and Item rent.
+
+Given the pool vault's balance in raw payment-token units,
+`pool.availableDraws(vaultBalance)` / `available_draws(vault_balance)` reports
+how many draws one purchase can afford from current inventory and collateral,
+capped at ten and zero unless active. `spendableBalance` / `spendable_balance` reports the surplus after
+pending refunds, usable for buybacks or withdrawals. These use the supplied
+snapshot and balance; buyer funds, token restrictions, and later state changes
+can still prevent execution.
 
 Applications with their own account source can use `Pool.fromAccount`,
 `Pull.fromAccount`, and `Item.fromAccount` (`from_account` in Rust). These own
 their bytes and check the owner, layout, and PDA; they do not authenticate an
 untrusted RPC provider. `Pool.buy` works from the 256-byte header. Offline
-settlement uses `Pool.settle` → fetch its `draws` → `Settlement.instructions`.
+settlement uses `Pool.settle` → fetch its drawn Items → fetch their Assets →
+`Settlement.instructions(items, assets, payer)`. `Asset.fromAccount` reads only
+the Core transfer header; full asset and plugin validation happens in Core.
 There is no unchecked randomness/output API.
 
 ### Transaction handling
@@ -228,9 +333,7 @@ recovery: previously delivered outcomes are skipped, and a fully delivered or
 refunded Pull no longer exists. Use confirmed transaction history to distinguish
 closure from an address that was never created.
 
-Pool, Item, and Pull versions remain **1**. Instruction layouts live beside
-their handlers; this development layout has no compatibility path for earlier
-draft accounts.
+Instruction layouts live beside their handlers.
 
 ## License
 

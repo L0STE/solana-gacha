@@ -2,9 +2,9 @@
   "name": "solana-gacha-workspace",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": ["packages/gacha-kit"],
   "scripts": {
-    "build": "tsc -b packages/gacha",
+    "build": "tsc -b packages/gacha-kit",
     "test": "bun run build && tsc -p tsconfig.test.json && bun test"
   },
   "devDependencies": {

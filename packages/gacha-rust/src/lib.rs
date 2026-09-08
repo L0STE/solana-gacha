@@ -6,7 +6,7 @@ mod rpc;
 #[cfg(feature = "rpc")]
 pub use rpc::{Client, RpcClient, RpcError};
 
-use crate::{constants::*, helpers::sha256, state};
+use gacha_core::{constants::*, state};
 use solana_ecvrf::{Proof, PublicKey};
 use solana_instruction::{AccountMeta, Instruction};
 use solana_message::Message;
@@ -16,10 +16,11 @@ use spl_associated_token_account_interface::{
     instruction::create_associated_token_account_idempotent,
 };
 
-pub use crate::errors::GachaError;
-pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(crate::ID);
+pub use gacha_core::errors::GachaError;
+pub const CORE_PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_core::asset::CORE_ID);
+pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_core::ID);
 pub const POOL_HEADER_LEN: usize = POOL_LEN;
-const TOKEN: Pubkey = Pubkey::new_from_array(pinocchio_token::ID);
+const TOKEN: Pubkey = solana_pubkey::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SYSTEM: Pubkey = Pubkey::new_from_array([0; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,9 @@ pub enum Error {
     NotNextInQueue,
     MissingInventory,
     InvalidItem,
+    InvalidAsset,
+    InvalidPoolStatus,
+    PendingPurchases,
     TransactionTooLarge,
 }
 
@@ -70,10 +74,18 @@ pub enum Status {
     Pending,
     Settled,
 }
+/// Only active pools accept buys and buybacks. Retirement is permanent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PoolStatus {
+    Paused = POOL_PAUSED,
+    Active = POOL_ACTIVE,
+    Retired = POOL_RETIRED,
+}
 /// `tier == None` means this outcome has already been delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Outcome {
-    pub mint: Pubkey,
+    pub asset: Pubkey,
     pub tier: Option<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,12 +95,57 @@ pub struct Draw {
     pub item: Pubkey,
 }
 
+/// Core ownership and collection snapshot. Core checks full state and plugin
+/// rules at execution; the SDK only reads the transfer header.
+#[derive(Clone, Copy, Debug)]
+pub struct Asset {
+    pub address: Pubkey,
+    pub owner: Pubkey,
+    pub collection: Option<Pubkey>,
+}
+
+impl Asset {
+    pub fn from_account(address: Pubkey, owner: Pubkey, data: &[u8]) -> Result<Self, Error> {
+        let header = gacha_core::asset::CoreAsset::from_account(&owner.to_bytes(), data)
+            .map_err(|_| Error::InvalidAsset)?;
+        Ok(Self {
+            address,
+            owner: Pubkey::new_from_array(*header.owner),
+            collection: header.collection.map(|key| Pubkey::new_from_array(*key)),
+        })
+    }
+}
+
 /// A fresh seed is required for each purchase attempt; never retry stale quotes
 /// with an already disclosed seed.
 pub struct Buy {
     pub buyer: Pubkey,
     pub count: u8,
     pub client_seed: [u8; 32],
+}
+
+/// An offer from the pool authority, reusable by any holder until expiry.
+#[derive(Clone, Copy, Debug)]
+pub struct BuybackQuote {
+    pub pool: Pubkey,
+    pub asset: Pubkey,
+    pub price: u64,
+    /// Unix timestamp in seconds. The quoting service sets the five-minute window.
+    pub expires_at: i64,
+    pub tier: u8,
+}
+
+impl BuybackQuote {
+    /// Sign these bytes with the pool authority's Ed25519 key.
+    pub fn message(&self) -> [u8; 129] {
+        gacha_core::buyback_message(
+            &self.pool.to_bytes(),
+            &self.asset.to_bytes(),
+            self.price,
+            self.expires_at,
+            self.tier,
+        )
+    }
 }
 
 /// Track this address after confirming `instruction`. Preparing is not buying.
@@ -109,7 +166,7 @@ pub struct CreatePool {
 }
 
 impl CreatePool {
-    /// Create the vault and pool atomically. Authority pays ATA and pool rent.
+    /// Create the vault and paused pool atomically. Authority pays ATA and pool rent.
     pub fn instructions(
         &self,
         authority: Pubkey,
@@ -190,8 +247,9 @@ impl Pool {
         };
         let h = pool.header();
         if !(1..=MAX_TIERS as u8).contains(&h.tier_count())
+            || h.status() > POOL_RETIRED
             || (data.len() != POOL_LEN
-                && data.len() != POOL_LEN + crate::inventory::space(h.inventory_version()))
+                && data.len() != POOL_LEN + inventory_space(h.inventory_version()))
             || Self::address_for(pool.authority(), h.id()) != address
             || pool.vault() != ata(address, pool.payment_mint())
             || h.price() == 0
@@ -228,7 +286,10 @@ impl Pool {
         unsafe { state::Pool::from_bytes_unchecked(&self.data) }
     }
     fn tag(&self, position: u32) -> u8 {
-        self.data[POOL_LEN + position as usize / 64 * 96 + 32 + position as usize % 64]
+        self.data[POOL_LEN
+            + position as usize / INVENTORY_TAGS_PER_BLOCK * INVENTORY_BLOCK_LEN
+            + INVENTORY_COUNTS_LEN
+            + position as usize % INVENTORY_TAGS_PER_BLOCK]
     }
     pub fn address(&self) -> Pubkey {
         self.address
@@ -246,9 +307,56 @@ impl Pool {
             .collect()
     }
 
+    pub fn status(&self) -> PoolStatus {
+        match self.header().status() {
+            POOL_PAUSED => PoolStatus::Paused,
+            POOL_ACTIVE => PoolStatus::Active,
+            _ => PoolStatus::Retired,
+        }
+    }
+
+    /// Authority controls admissions. Retirement is terminal; buyer exits stay open.
+    pub fn set_status(&self, status: PoolStatus) -> Result<Instruction, Error> {
+        if self.status() == PoolStatus::Retired && status != PoolStatus::Retired {
+            return Err(Error::InvalidPoolStatus);
+        }
+        Ok(instruction(
+            vec![3, status as u8],
+            vec![ro(self.authority(), true), rw(self.address, false)],
+        ))
+    }
+
+    /// Surplus after reserving all pending refunds. Supply this pool's current
+    /// vault balance in raw payment-token units; execution rechecks the balance.
+    pub fn spendable_balance(&self, vault_balance: u64) -> Result<u64, Error> {
+        let reserved = self
+            .header()
+            .refund_amount(self.pending_draws())
+            .map_err(|_| Error::InvalidAccount)?;
+        Ok(vault_balance.saturating_sub(reserved))
+    }
+
+    /// Maximum draws given stock and collateral; zero unless the pool is active.
+    /// Buyer funds, token restrictions and changes after this read can still block it.
+    pub fn available_draws(&self, vault_balance: u64) -> Result<u8, Error> {
+        if self.status() != PoolStatus::Active {
+            return Ok(0);
+        }
+        let stock = self
+            .header()
+            .remaining()
+            .checked_sub(self.pending_draws())
+            .ok_or(Error::InvalidAccount)?;
+        let funded = self.spendable_balance(vault_balance)? / self.bond_per_draw();
+        Ok(stock.min(funded).min(MAX_COUNT as u64) as u8)
+    }
+
     /// Use a fresh random seed. Restocking or another purchase may stale the
     /// snapshot; refetch and use a new seed before asking for another signature.
     pub fn buy(&self, buy: Buy) -> Result<Purchase, Error> {
+        if self.status() != PoolStatus::Active {
+            return Err(Error::InvalidPoolStatus);
+        }
         let Buy {
             buyer,
             count,
@@ -278,30 +386,114 @@ impl Pool {
         })
     }
 
-    /// Create custody ATA if needed, then deposit. Submit these together.
-    pub fn deposit(&self, tier: u8, mint: Pubkey) -> Result<Vec<Instruction>, Error> {
+    /// Deposit an owned Core asset. Collection accounts come from the asset snapshot.
+    pub fn deposit(&self, tier: u8, asset: &Asset) -> Result<Instruction, Error> {
+        if self.status() == PoolStatus::Retired {
+            return Err(Error::InvalidPoolStatus);
+        }
         if tier >= self.header().tier_count() {
             return Err(Error::InvalidArgument);
         }
+        if asset.owner != self.authority() {
+            return Err(Error::InvalidAsset);
+        }
+        Ok(instruction(
+            vec![1, tier],
+            vec![
+                rw(self.authority(), true),
+                rw(self.address, false),
+                rw(
+                    Item::address_for(self.address, tier, self.inventory_version()),
+                    false,
+                ),
+                rw(asset.address, false),
+                ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
+                ro(CORE_PROGRAM_ID, false),
+                ro(SYSTEM, false),
+            ],
+        ))
+    }
+
+    /// Return the prize, pay the seller, and restock atomically. Payer sponsors rent.
+    /// Refetch the pool and rebuild on an inventory race; the quote remains usable.
+    pub fn buyback(
+        &self,
+        quote: &BuybackQuote,
+        signature: &[u8; 64],
+        asset: &Asset,
+        payer: Pubkey,
+    ) -> Result<Vec<Instruction>, Error> {
+        if self.status() != PoolStatus::Active {
+            return Err(Error::InvalidPoolStatus);
+        }
+        if quote.pool != self.address {
+            return Err(Error::WrongPool);
+        }
+        if quote.tier >= self.header().tier_count() || quote.price == 0 || quote.expires_at <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if quote.asset != asset.address || asset.owner == self.address {
+            return Err(Error::InvalidAsset);
+        }
+        let mut data = vec![12, quote.tier];
+        data.extend(quote.price.to_le_bytes());
+        data.extend(quote.expires_at.to_le_bytes());
+        data.extend(signature);
         Ok(vec![
-            create_ata(self.authority(), self.address, mint),
+            create_ata(payer, asset.owner, self.payment_mint()),
             instruction(
-                vec![1, tier],
+                data,
                 vec![
-                    rw(self.authority(), true),
+                    rw(payer, true),
+                    ro(asset.owner, true),
                     rw(self.address, false),
                     rw(
-                        Item::address_for(self.address, tier, self.inventory_version()),
+                        Item::address_for(self.address, quote.tier, self.inventory_version()),
                         false,
                     ),
-                    ro(mint, false),
-                    rw(ata(self.authority(), mint), false),
-                    rw(ata(self.address, mint), false),
+                    rw(asset.address, false),
+                    ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
+                    rw(self.vault(), false),
+                    rw(ata(asset.owner, self.payment_mint()), false),
+                    ro(CORE_PROGRAM_ID, false),
                     ro(TOKEN, false),
                     ro(SYSTEM, false),
                 ],
             ),
         ])
+    }
+
+    /// Return one unsold asset and its Item rent to the authority after retirement.
+    /// Pending purchases must settle or refund first; awarded Items cannot be reclaimed.
+    pub fn reclaim(&self, item: &Item, asset: &Asset) -> Result<Instruction, Error> {
+        if self.status() != PoolStatus::Retired {
+            return Err(Error::InvalidPoolStatus);
+        }
+        if self.pending_draws() != 0 {
+            return Err(Error::PendingPurchases);
+        }
+        if item.pool() != self.address
+            || item.tier() >= self.header().tier_count()
+            || item.position() >= self.inventory_version()
+            || item.asset() != asset.address
+        {
+            return Err(Error::InvalidItem);
+        }
+        if asset.owner != self.address {
+            return Err(Error::InvalidAsset);
+        }
+        Ok(instruction(
+            vec![4],
+            vec![
+                rw(self.authority(), true),
+                rw(self.address, false),
+                rw(item.address(), false),
+                rw(asset.address, false),
+                ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
+                ro(CORE_PROGRAM_ID, false),
+                ro(SYSTEM, false),
+            ],
+        ))
     }
 
     pub fn withdraw(&self, destination: Pubkey, amount: u64) -> Instruction {
@@ -319,21 +511,24 @@ impl Pool {
         )
     }
 
-    /// The chain checks the current deadline and collateral; no clock is cached.
-    /// Prepend native ATA CreateIdempotent if the buyer's payment ATA may be closed.
-    pub fn refund(&self, pull: &Pull) -> Result<Instruction, Error> {
+    /// Recreate the buyer's payment ATA if needed and refund atomically. Only
+    /// payer signs; the chain checks the current deadline and collateral.
+    pub fn refund(&self, pull: &Pull, payer: Pubkey) -> Result<Vec<Instruction>, Error> {
         self.pending(pull)?;
-        Ok(instruction(
-            vec![11],
-            vec![
-                rw(self.address, false),
-                rw(pull.address, false),
-                rw(pull.buyer(), false),
-                rw(self.vault(), false),
-                rw(ata(pull.buyer(), self.payment_mint()), false),
-                ro(TOKEN, false),
-            ],
-        ))
+        Ok(vec![
+            create_ata(payer, pull.buyer(), self.payment_mint()),
+            instruction(
+                vec![11],
+                vec![
+                    rw(self.address, false),
+                    rw(pull.address, false),
+                    rw(pull.buyer(), false),
+                    rw(self.vault(), false),
+                    rw(ata(pull.buyer(), self.payment_mint()), false),
+                    ro(TOKEN, false),
+                ],
+            ),
+        ])
     }
 
     fn pending(&self, pull: &Pull) -> Result<(), Error> {
@@ -356,7 +551,7 @@ impl Pool {
     /// cannot affect this plan. The chain rechecks proof, queue and deadline.
     pub fn settle(&self, pull: &Pull, proof: &Proof) -> Result<Settlement, Error> {
         self.pending(pull)?;
-        if self.data.len() != POOL_LEN + crate::inventory::space(self.inventory_version()) {
+        if self.data.len() != POOL_LEN + inventory_space(self.inventory_version()) {
             return Err(Error::MissingInventory);
         }
         let beta = proof
@@ -463,33 +658,43 @@ impl Pull {
         }
         Ok((0..self.count() as usize)
             .map(|i| {
-                let (tier, mint) = self.header().outcome(i);
+                let (tier, asset) = self.header().outcome(i);
                 Outcome {
-                    mint: Pubkey::new_from_array(*mint),
+                    asset: Pubkey::new_from_array(*asset),
                     tier: (tier != DELIVERED).then_some(tier),
                 }
             })
             .collect())
     }
     /// Recovery after partial delivery: only undelivered outcomes are included.
-    pub fn deliver(&self, payer: Pubkey) -> Result<Vec<Vec<Instruction>>, Error> {
-        let pairs = self
-            .outcomes()?
+    pub fn deliver(&self, assets: &[Asset], payer: Pubkey) -> Result<Vec<Vec<Instruction>>, Error> {
+        let outcomes = self.outcomes()?;
+        let pending: Vec<_> = outcomes
             .iter()
             .enumerate()
             .filter(|(_, o)| o.tier.is_some())
-            .map(|(i, o)| {
-                delivery_pair(
+            .collect();
+        if pending.len() != assets.len() {
+            return Err(Error::InvalidAsset);
+        }
+        let instructions = pending
+            .iter()
+            .zip(assets)
+            .map(|((i, outcome), asset)| {
+                if outcome.asset != asset.address {
+                    return Err(Error::InvalidAsset);
+                }
+                deliver(
                     self.pool(),
                     self.address,
                     self.buyer(),
-                    o.mint,
-                    i as u8,
+                    asset,
+                    *i as u8,
                     payer,
                 )
             })
-            .collect();
-        batches(Vec::new(), pairs, payer)
+            .collect::<Result<Vec<_>, _>>()?;
+        batches(Vec::new(), instructions, payer)
     }
 }
 
@@ -521,12 +726,12 @@ impl Item {
     pub fn address(&self) -> Pubkey {
         self.address
     }
-    key_getters!(pool, mint);
+    key_getters!(pool, asset);
     number_getters!(tier: u8, position: u32);
 }
 
 /// Created only by Pool::settle after proof verification. Fetch `draws().item`
-/// accounts, decode them as Item, then compose settlement and delivery.
+/// accounts, decode them as Item, fetch their Asset headers, then compose delivery.
 #[derive(Clone, Debug)]
 pub struct Settlement {
     pool: Pubkey,
@@ -551,11 +756,12 @@ impl Settlement {
         accounts.extend(self.draws.iter().map(|d| rw(d.item, false)));
         instruction(data, accounts)
     }
-    /// Items must correspond to draws in order. Groups fit legacy transactions
-    /// with this payer; adding instructions/signers requires another size check.
+    /// Items and assets must correspond to draws in order. Groups fit legacy
+    /// transactions with this payer; additions require another size check.
     pub fn instructions(
         &self,
         items: &[Item],
+        assets: &[Asset],
         payer: Pubkey,
     ) -> Result<Vec<Vec<Instruction>>, Error> {
         if items.len() != self.draws.len()
@@ -566,26 +772,26 @@ impl Settlement {
         {
             return Err(Error::InvalidItem);
         }
-        let pairs = items
+        if assets.len() != items.len() {
+            return Err(Error::InvalidAsset);
+        }
+        let instructions = items
             .iter()
+            .zip(assets)
             .enumerate()
-            .map(|(i, item)| {
-                delivery_pair(
-                    self.pool,
-                    self.pull,
-                    self.buyer,
-                    item.mint(),
-                    i as u8,
-                    payer,
-                )
+            .map(|(i, (item, asset))| {
+                if item.asset() != asset.address {
+                    return Err(Error::InvalidAsset);
+                }
+                deliver(self.pool, self.pull, self.buyer, asset, i as u8, payer)
             })
-            .collect();
-        batches(vec![self.instruction()], pairs, payer)
+            .collect::<Result<Vec<_>, _>>()?;
+        batches(vec![self.instruction()], instructions, payer)
     }
 }
 
 fn check(owner: Pubkey, data: &[u8], minimum: usize) -> Result<(), Error> {
-    if owner != PROGRAM_ID || data.len() < minimum || data[0] != 1 {
+    if owner != PROGRAM_ID || data.len() < minimum || data[0] != POOL_VERSION {
         return Err(Error::InvalidAccount);
     }
     Ok(())
@@ -606,53 +812,52 @@ fn instruction(data: Vec<u8>, accounts: Vec<AccountMeta>) -> Instruction {
         data,
     }
 }
-fn deliver(pool: Pubkey, pull: Pubkey, buyer: Pubkey, mint: Pubkey, outcome: u8) -> Instruction {
-    instruction(
-        vec![21, outcome],
-        vec![
-            ro(pool, false),
-            rw(pull, false),
-            rw(buyer, false),
-            rw(ata(pool, mint), false),
-            rw(ata(buyer, mint), false),
-            ro(TOKEN, false),
-        ],
-    )
-}
-fn delivery_pair(
+fn deliver(
     pool: Pubkey,
     pull: Pubkey,
     buyer: Pubkey,
-    mint: Pubkey,
+    asset: &Asset,
     outcome: u8,
     payer: Pubkey,
-) -> [Instruction; 2] {
-    [
-        create_ata(payer, buyer, mint),
-        deliver(pool, pull, buyer, mint, outcome),
-    ]
+) -> Result<Instruction, Error> {
+    if asset.owner != pool {
+        return Err(Error::InvalidAsset);
+    }
+    Ok(instruction(
+        vec![21, outcome],
+        vec![
+            rw(payer, true),
+            ro(pool, false),
+            rw(pull, false),
+            rw(buyer, false),
+            rw(asset.address, false),
+            ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
+            ro(CORE_PROGRAM_ID, false),
+            ro(SYSTEM, false),
+        ],
+    ))
 }
 fn create_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction {
     create_associated_token_account_idempotent(&payer, &owner, &mint, &TOKEN)
 }
 fn batches(
     initial: Vec<Instruction>,
-    pairs: Vec<[Instruction; 2]>,
+    instructions: Vec<Instruction>,
     payer: Pubkey,
 ) -> Result<Vec<Vec<Instruction>>, Error> {
     let mut transactions = vec![initial];
     if transaction_size(&transactions[0], payer) > 1232 {
         return Err(Error::TransactionTooLarge);
     }
-    for pair in pairs {
+    for instruction in instructions {
         let current = transactions.last_mut().unwrap();
-        current.extend(pair);
+        current.push(instruction);
         if transaction_size(current, payer) > 1232 {
-            let pair = current.split_off(current.len() - 2);
-            if transaction_size(&pair, payer) > 1232 {
+            let next = current.split_off(current.len() - 1);
+            if transaction_size(&next, payer) > 1232 {
                 return Err(Error::TransactionTooLarge);
             }
-            transactions.push(pair);
+            transactions.push(next);
         }
     }
     transactions.retain(|group| !group.is_empty());
@@ -661,4 +866,13 @@ fn batches(
 fn transaction_size(instructions: &[Instruction], payer: Pubkey) -> usize {
     let message = Message::new(instructions, Some(&payer));
     1 + 64 * message.header.num_required_signatures as usize + message.serialize().len()
+}
+
+fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hash = sha2::Sha256::new();
+    for part in parts {
+        hash.update(part);
+    }
+    hash.finalize().into()
 }

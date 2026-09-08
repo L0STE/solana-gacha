@@ -10,8 +10,8 @@
         "typescript": "^5.9.0",
       },
     },
-    "packages/gacha": {
-      "name": "@blueshift-gg/gacha",
+    "packages/gacha-kit": {
+      "name": "@blueshift-gg/gacha-kit",
       "version": "0.0.1",
       "dependencies": {
         "@noble/hashes": "^2.4.0",
@@ -26,7 +26,7 @@
     },
   },
   "packages": {
-    "@blueshift-gg/gacha": ["@blueshift-gg/gacha@workspace:packages/gacha"],
+    "@blueshift-gg/gacha-kit": ["@blueshift-gg/gacha-kit@workspace:packages/gacha-kit"],
 
     "@blueshift-gg/solana-ecvrf": ["@blueshift-gg/solana-ecvrf@0.0.1", "", { "dependencies": { "@noble/curves": "^2.4.0", "@noble/hashes": "^2.4.0" } }, "sha512-awXYJa9Me348vlHmMwpQvQHibF9pu7vBKeOsoMuPyhCIU5ReN4feLCZ6cjNyTGGFvnWlPBPinqZfMt620bkCpA=="],
 
