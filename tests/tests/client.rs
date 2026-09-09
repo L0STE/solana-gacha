@@ -146,6 +146,11 @@ fn client_flow_and_trust_boundaries() {
     assert!(instructions.len() > 1);
     let refund = pool.refund(&pull, operator).unwrap();
     let withdraw = pool.withdraw(ata(&f.authority, &f.payment_mint), u64::MAX);
+    // The SDK's withdraw runs on chain: surplus above the ten pending refunds is free.
+    assert!(f
+        .run(&pool.withdraw(ata(&f.authority, &f.payment_mint), 1))
+        .program_result
+        .is_ok());
 
     assert_eq!(
         pool.settle(&pull, &SecretKey([8; 32]).prove(&pull.alpha()))
