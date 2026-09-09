@@ -21,13 +21,17 @@ pub fn buyback_message(
     expires_at: i64,
     tier: u8,
 ) -> [u8; 129] {
-    let mut message = [0; 129];
-    message[..16].copy_from_slice(b"gacha:buyback:v1");
-    message[16..48].copy_from_slice(&ID);
-    message[48..80].copy_from_slice(pool);
-    message[80..112].copy_from_slice(asset);
-    message[112..120].copy_from_slice(&price.to_le_bytes());
-    message[120..128].copy_from_slice(&expires_at.to_le_bytes());
-    message[128] = tier;
-    message
+    let mut message = core::mem::MaybeUninit::<[u8; 129]>::uninit();
+    let out = message.as_mut_ptr() as *mut u8;
+    // SAFETY: the seven writes below cover bytes 0..129 exactly, with no gaps.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b"gacha:buyback:v1".as_ptr(), out, 16);
+        core::ptr::copy_nonoverlapping(ID.as_ptr(), out.add(16), 32);
+        core::ptr::copy_nonoverlapping(pool.as_ptr(), out.add(48), 32);
+        core::ptr::copy_nonoverlapping(asset.as_ptr(), out.add(80), 32);
+        core::ptr::copy_nonoverlapping(price.to_le_bytes().as_ptr(), out.add(112), 8);
+        core::ptr::copy_nonoverlapping(expires_at.to_le_bytes().as_ptr(), out.add(120), 8);
+        out.add(128).write(tier);
+        message.assume_init()
+    }
 }

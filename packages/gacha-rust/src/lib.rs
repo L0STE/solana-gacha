@@ -20,6 +20,8 @@ pub use gacha_core::errors::GachaError;
 pub const CORE_PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_core::asset::CORE_ID);
 pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(gacha_core::ID);
 pub const POOL_HEADER_LEN: usize = POOL_LEN;
+/// Every instruction ends with this PDA and the program; events are emitted through them.
+pub const EVENT_AUTHORITY: Pubkey = Pubkey::new_from_array(gacha_core::constants::EVENT_AUTHORITY);
 const TOKEN: Pubkey = solana_pubkey::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SYSTEM: Pubkey = Pubkey::new_from_array([0; 32]);
 
@@ -166,7 +168,8 @@ pub struct CreatePool {
 }
 
 impl CreatePool {
-    /// Create the vault and paused pool atomically. Authority pays ATA and pool rent.
+    /// Create the vault and paused pool atomically, then fund the vault with
+    /// `bond` from the authority's payment ATA. Authority pays ATA and pool rent.
     pub fn instructions(
         &self,
         authority: Pubkey,
@@ -187,22 +190,17 @@ impl CreatePool {
         {
             return Err(Error::InvalidArgument);
         }
-        let pool = Pool::address_for(authority, self.id);
+        let (pool, bump) = Pool::address_for(authority, self.id);
         let mut data = vec![0];
-        for n in [
-            self.id,
-            self.price,
-            self.deadline_slots,
-            self.bond_per_draw,
-            self.bond,
-        ] {
+        for n in [self.id, self.price, self.deadline_slots, self.bond_per_draw] {
             data.extend(n.to_le_bytes());
         }
         data.push(self.weights.len() as u8);
         for i in 0..MAX_TIERS {
             data.extend(self.weights.get(i).copied().unwrap_or(0).to_le_bytes());
         }
-        Ok(vec![
+        data.push(bump);
+        let mut instructions = vec![
             create_ata(authority, pool, payment_mint),
             instruction(
                 data,
@@ -211,13 +209,20 @@ impl CreatePool {
                     rw(pool, false),
                     ro(operator, false),
                     ro(payment_mint, false),
-                    rw(ata(pool, payment_mint), false),
-                    rw(ata(authority, payment_mint), false),
-                    ro(TOKEN, false),
+                    ro(ata(pool, payment_mint), false),
                     ro(SYSTEM, false),
                 ],
             ),
-        ])
+        ];
+        if self.bond > 0 {
+            instructions.push(token_transfer(
+                ata(authority, payment_mint),
+                ata(pool, payment_mint),
+                authority,
+                self.bond,
+            ));
+        }
+        Ok(instructions)
     }
 }
 
@@ -229,18 +234,18 @@ macro_rules! key_getters {
 }
 
 impl Pool {
-    pub fn address_for(authority: Pubkey, id: u64) -> Pubkey {
+    /// Address and bump; the bump travels in CreatePool's instruction data.
+    pub fn address_for(authority: Pubkey, id: u64) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[POOL_SEED, authority.as_ref(), &id.to_le_bytes()],
             &PROGRAM_ID,
         )
-        .0
     }
 
     /// A 256-byte RPC dataSlice suffices for purchases/admin operations. Settlement
     /// needs the complete account. Decoding does not authenticate the RPC provider.
     pub fn from_account(address: Pubkey, owner: Pubkey, data: &[u8]) -> Result<Self, Error> {
-        check(owner, data, POOL_LEN)?;
+        check(owner, data, POOL_LEN, POOL_VERSION)?;
         let pool = Self {
             address,
             data: data.to_vec(),
@@ -250,7 +255,7 @@ impl Pool {
             || h.status() > POOL_RETIRED
             || (data.len() != POOL_LEN
                 && data.len() != POOL_LEN + inventory_space(h.inventory_version()))
-            || Self::address_for(pool.authority(), h.id()) != address
+            || Self::address_for(pool.authority(), h.id()) != (address, h.bump())
             || pool.vault() != ata(address, pool.payment_mint())
             || h.price() == 0
             || h.bond_per_draw() == 0
@@ -365,10 +370,11 @@ impl Pool {
         if !(1..=MAX_COUNT as u8).contains(&count) {
             return Err(Error::InvalidArgument);
         }
+        let (pull, bump) = Pull::address_for(self.address, &client_seed);
         let mut data = vec![10, count];
         data.extend(client_seed);
         data.extend(self.inventory_version().to_le_bytes());
-        let pull = Pull::address_for(self.address, self.next_index());
+        data.push(bump);
         Ok(Purchase {
             pull,
             instruction: instruction(
@@ -397,15 +403,13 @@ impl Pool {
         if asset.owner != self.authority() {
             return Err(Error::InvalidAsset);
         }
+        let (item, bump) = Item::address_for(self.address, tier, self.inventory_version());
         Ok(instruction(
-            vec![1, tier],
+            vec![1, tier, bump],
             vec![
                 rw(self.authority(), true),
                 rw(self.address, false),
-                rw(
-                    Item::address_for(self.address, tier, self.inventory_version()),
-                    false,
-                ),
+                rw(item, false),
                 rw(asset.address, false),
                 ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
                 ro(CORE_PROGRAM_ID, false),
@@ -435,10 +439,12 @@ impl Pool {
         if quote.asset != asset.address || asset.owner == self.address {
             return Err(Error::InvalidAsset);
         }
+        let (item, bump) = Item::address_for(self.address, quote.tier, self.inventory_version());
         let mut data = vec![12, quote.tier];
         data.extend(quote.price.to_le_bytes());
         data.extend(quote.expires_at.to_le_bytes());
         data.extend(signature);
+        data.push(bump);
         Ok(vec![
             create_ata(payer, asset.owner, self.payment_mint()),
             instruction(
@@ -447,10 +453,7 @@ impl Pool {
                     rw(payer, true),
                     ro(asset.owner, true),
                     rw(self.address, false),
-                    rw(
-                        Item::address_for(self.address, quote.tier, self.inventory_version()),
-                        false,
-                    ),
+                    rw(item, false),
                     rw(asset.address, false),
                     ro(asset.collection.unwrap_or(CORE_PROGRAM_ID), false),
                     rw(self.vault(), false),
@@ -573,18 +576,15 @@ impl Pool {
             for (t, entries) in candidates.iter().enumerate() {
                 counts[t] = entries.len() as u32;
             }
-            let tier = self
+            let (tier, rank) = self
                 .header()
-                .draw_tier(&hash, &counts)
+                .draw(&hash, &counts)
                 .map_err(|_| Error::InvalidAccount)?;
-            let list = &mut candidates[tier as usize];
-            let rank =
-                (u64::from_le_bytes(hash[8..16].try_into().unwrap()) % list.len() as u64) as usize;
-            let position = list.remove(rank);
+            let position = candidates[tier as usize].remove(rank as usize);
             draws.push(Draw {
                 tier,
                 position,
-                item: Item::address_for(self.address, tier, position),
+                item: Item::address_for(self.address, tier, position).0,
             });
         }
         Ok(Settlement {
@@ -599,15 +599,13 @@ impl Pool {
 }
 
 impl Pull {
-    pub fn address_for(pool: Pubkey, index: u64) -> Pubkey {
-        Pubkey::find_program_address(
-            &[PULL_SEED, pool.as_ref(), &index.to_le_bytes()],
-            &PROGRAM_ID,
-        )
-        .0
+    /// Address and bump; the bump travels in Buy's instruction data. The FIFO
+    /// index is assigned on execution and recorded in the account.
+    pub fn address_for(pool: Pubkey, client_seed: &[u8; 32]) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[PULL_SEED, pool.as_ref(), client_seed], &PROGRAM_ID)
     }
     pub fn from_account(address: Pubkey, owner: Pubkey, data: &[u8]) -> Result<Self, Error> {
-        check(owner, data, PULL_LEN)?;
+        check(owner, data, PULL_LEN, PULL_VERSION)?;
         if data.len() != PULL_LEN
             || data[2] > STATUS_SETTLED
             || !(1..=MAX_COUNT as u8).contains(&data[3])
@@ -618,7 +616,8 @@ impl Pull {
             address,
             data: data.to_vec(),
         };
-        if Self::address_for(pull.pool(), pull.index()) != address {
+        // SDK-built accounts always carry the canonical bump.
+        if Self::address_for(pull.pool(), &pull.client_seed()) != (address, pull.header().bump()) {
             return Err(Error::InvalidAccount);
         }
         if pull.status() == Status::Settled
@@ -699,15 +698,15 @@ impl Pull {
 }
 
 impl Item {
-    pub fn address_for(pool: Pubkey, tier: u8, position: u32) -> Pubkey {
+    /// Address and bump; the bump travels in DepositItem's and Buyback's instruction data.
+    pub fn address_for(pool: Pubkey, tier: u8, position: u32) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[ITEM_SEED, pool.as_ref(), &[tier], &position.to_le_bytes()],
             &PROGRAM_ID,
         )
-        .0
     }
     pub fn from_account(address: Pubkey, owner: Pubkey, data: &[u8]) -> Result<Self, Error> {
-        check(owner, data, ITEM_LEN)?;
+        check(owner, data, ITEM_LEN, ITEM_VERSION)?;
         if data.len() != ITEM_LEN || data[2] as usize >= MAX_TIERS {
             return Err(Error::InvalidAccount);
         }
@@ -715,7 +714,9 @@ impl Item {
             address,
             data: data.to_vec(),
         };
-        if Self::address_for(item.pool(), item.tier(), item.position()) != address {
+        if Self::address_for(item.pool(), item.tier(), item.position())
+            != (address, item.header().bump())
+        {
             return Err(Error::InvalidAccount);
         }
         Ok(item)
@@ -790,8 +791,8 @@ impl Settlement {
     }
 }
 
-fn check(owner: Pubkey, data: &[u8], minimum: usize) -> Result<(), Error> {
-    if owner != PROGRAM_ID || data.len() < minimum || data[0] != POOL_VERSION {
+fn check(owner: Pubkey, data: &[u8], minimum: usize, version: u8) -> Result<(), Error> {
+    if owner != PROGRAM_ID || data.len() < minimum || data[0] != version {
         return Err(Error::InvalidAccount);
     }
     Ok(())
@@ -805,7 +806,10 @@ fn rw(key: Pubkey, signer: bool) -> AccountMeta {
 fn ro(key: Pubkey, signer: bool) -> AccountMeta {
     AccountMeta::new_readonly(key, signer)
 }
-fn instruction(data: Vec<u8>, accounts: Vec<AccountMeta>) -> Instruction {
+/// Every instruction ends with the event authority and the program, for the event CPI.
+fn instruction(data: Vec<u8>, mut accounts: Vec<AccountMeta>) -> Instruction {
+    accounts.push(ro(EVENT_AUTHORITY, false));
+    accounts.push(ro(PROGRAM_ID, false));
     Instruction {
         program_id: PROGRAM_ID,
         accounts,
@@ -836,6 +840,16 @@ fn deliver(
             ro(SYSTEM, false),
         ],
     ))
+}
+/// SPL Token `Transfer`; collateral enters the vault as an ordinary transfer.
+fn token_transfer(from: Pubkey, to: Pubkey, authority: Pubkey, amount: u64) -> Instruction {
+    let mut data = vec![3];
+    data.extend(amount.to_le_bytes());
+    Instruction {
+        program_id: TOKEN,
+        accounts: vec![rw(from, false), rw(to, false), ro(authority, true)],
+        data,
+    }
 }
 fn create_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction {
     create_associated_token_account_idempotent(&payer, &owner, &mint, &TOKEN)

@@ -16,6 +16,7 @@ pub const TOKEN: Pubkey = mollusk_svm_programs_token::token::ID;
 pub const ATA_PROGRAM: Pubkey =
     solana_pubkey::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const SYSTEM: Pubkey = Pubkey::new_from_array([0; 32]);
+pub const EVENT_AUTHORITY: Pubkey = gacha_rust::EVENT_AUTHORITY;
 
 pub const AUTHORITY_SEED: [u8; 32] = [7; 32];
 
@@ -49,12 +50,12 @@ pub fn item_pda(pool: &Pubkey, tier: u8, position: u32) -> Pubkey {
     .0
 }
 
-pub fn pull_pda(pool: &Pubkey, index: u64) -> Pubkey {
-    Pubkey::find_program_address(
-        &[PULL_SEED, pool.as_ref(), &index.to_le_bytes()],
-        &PROGRAM_ID,
-    )
-    .0
+pub fn pull_pda(pool: &Pubkey, seed: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[PULL_SEED, pool.as_ref(), seed], &PROGRAM_ID).0
+}
+
+fn bump(seeds: &[&[u8]]) -> u8 {
+    Pubkey::find_program_address(seeds, &PROGRAM_ID).1
 }
 
 /// An SPL token account, packed by hand (165 bytes).
@@ -186,7 +187,6 @@ pub struct Fixture {
     pub vault: Pubkey,
     pub accounts: Vec<(Pubkey, Account)>,
     pub model: Model,
-    pub next_index: u64,
 }
 
 impl Fixture {
@@ -232,6 +232,11 @@ impl Fixture {
                 CORE,
                 mollusk_svm::program::create_program_account_loader_v3(&CORE),
             ),
+            // The program's own account: every instruction passes it for the event CPI.
+            (
+                PROGRAM_ID,
+                mollusk_svm::program::create_program_account_loader_v3(&PROGRAM_ID),
+            ),
             mollusk_svm_programs_token::token::keyed_account(),
             mollusk_svm_programs_token::associated_token::keyed_account(),
         ];
@@ -250,7 +255,6 @@ impl Fixture {
                 weights: WEIGHTS.to_vec(),
                 items: vec![],
             },
-            next_index: 0,
         }
     }
 
@@ -360,13 +364,17 @@ impl Fixture {
         data.extend(PRICE.to_le_bytes());
         data.extend(DEADLINE_SLOTS.to_le_bytes());
         data.extend(BOND_PER_DRAW.to_le_bytes());
-        data.extend(BOND.to_le_bytes());
         data.push(WEIGHTS.len() as u8);
         let mut weights = [0u32; 8];
         weights[..WEIGHTS.len()].copy_from_slice(&WEIGHTS);
         for w in weights {
             data.extend(w.to_le_bytes());
         }
+        data.push(bump(&[
+            POOL_SEED,
+            self.authority.as_ref(),
+            &1u64.to_le_bytes(),
+        ]));
         Instruction::new_with_bytes(
             PROGRAM_ID,
             &data,
@@ -375,18 +383,34 @@ impl Fixture {
                 AccountMeta::new(self.pool, false),
                 AccountMeta::new_readonly(self.operator, false),
                 AccountMeta::new_readonly(self.payment_mint, false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new(ata(&self.authority, &self.payment_mint), false),
-                AccountMeta::new_readonly(TOKEN, false),
+                AccountMeta::new_readonly(self.vault, false),
                 AccountMeta::new_readonly(SYSTEM, false),
+                AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
             ],
         )
     }
 
-    /// Bootstrap an active pool for flow tests; lifecycle tests create it explicitly.
+    /// Ordinary SPL transfer of `amount` from the authority's ATA into the vault.
+    pub fn fund_ix(&self, amount: u64) -> Instruction {
+        let mut data = vec![3u8];
+        data.extend(amount.to_le_bytes());
+        Instruction::new_with_bytes(
+            TOKEN,
+            &data,
+            vec![
+                AccountMeta::new(ata(&self.authority, &self.payment_mint), false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.authority, true),
+            ],
+        )
+    }
+
+    /// Bootstrap a funded, active pool for flow tests; lifecycle tests create it explicitly.
     pub fn open_pool(&mut self) -> InstructionResult {
         let result = self.run(&self.create_pool_ix());
         if result.program_result.is_ok() {
+            assert!(self.run(&self.fund_ix(BOND)).program_result.is_ok());
             self.run(
                 &self
                     .client_pool()
@@ -412,7 +436,16 @@ impl Fixture {
         let asset = Pubkey::new_unique();
         self.upsert(asset, core_asset(&self.authority, None));
         let position = self.model.items.len() as u32;
-        let data = [1u8, tier];
+        let data = [
+            1u8,
+            tier,
+            bump(&[
+                ITEM_SEED,
+                self.pool.as_ref(),
+                &[tier],
+                &position.to_le_bytes(),
+            ]),
+        ];
         Instruction::new_with_bytes(
             PROGRAM_ID,
             &data,
@@ -424,6 +457,8 @@ impl Fixture {
                 AccountMeta::new_readonly(CORE, false),
                 AccountMeta::new_readonly(CORE, false),
                 AccountMeta::new_readonly(SYSTEM, false),
+                AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
             ],
         )
     }
@@ -432,28 +467,27 @@ impl Fixture {
         let mut data = vec![10u8, count];
         data.extend(seed);
         data.extend((self.model.items.len() as u32).to_le_bytes());
+        data.push(bump(&[PULL_SEED, self.pool.as_ref(), &seed]));
         Instruction::new_with_bytes(
             PROGRAM_ID,
             &data,
             vec![
                 AccountMeta::new(self.buyer, true),
                 AccountMeta::new(self.pool, false),
-                AccountMeta::new(pull_pda(&self.pool, self.next_index), false),
+                AccountMeta::new(pull_pda(&self.pool, &seed), false),
                 AccountMeta::new(ata(&self.buyer, &self.payment_mint), false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(TOKEN, false),
                 AccountMeta::new_readonly(SYSTEM, false),
+                AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
             ],
         )
     }
 
     pub fn buy(&mut self, count: u8, seed: [u8; 32]) -> (Pubkey, InstructionResult) {
-        let pull = pull_pda(&self.pool, self.next_index);
         let result = self.run(&self.buy_ix(count, seed));
-        if result.program_result.is_ok() {
-            self.next_index += 1;
-        }
-        (pull, result)
+        (pull_pda(&self.pool, &seed), result)
     }
 
     /// The operator's job: prove, walk the model, pass the item accounts.
@@ -487,6 +521,8 @@ impl Fixture {
             ));
             outcomes.push((tier, asset));
         }
+        metas.push(AccountMeta::new_readonly(EVENT_AUTHORITY, false));
+        metas.push(AccountMeta::new_readonly(PROGRAM_ID, false));
         let mut data = vec![20u8];
         data.extend(proof.0);
         (
@@ -516,6 +552,8 @@ impl Fixture {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new(ata(&self.buyer, &self.payment_mint), false),
                 AccountMeta::new_readonly(TOKEN, false),
+                AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
             ],
         );
         self.run(&ix)
@@ -533,6 +571,8 @@ impl Fixture {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new(ata(&self.authority, &self.payment_mint), false),
                 AccountMeta::new_readonly(TOKEN, false),
+                AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
             ],
         );
         self.run(&ix)

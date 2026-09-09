@@ -14,7 +14,67 @@
 
 use crate::constants::*;
 use crate::errors::GachaError;
-use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
+use pinocchio::{instruction::Seed, program_error::ProgramError, pubkey::Pubkey};
+
+/// Pool signer seeds `[POOL_SEED, authority, id, bump]`, owned so a handler
+/// can build them once and sign with `as_seeds()`.
+pub struct PoolSeeds {
+    authority: Pubkey,
+    id: [u8; 8],
+    bump: [u8; 1],
+}
+
+impl PoolSeeds {
+    #[inline(always)]
+    pub fn as_seeds(&self) -> [Seed<'_>; 4] {
+        [
+            Seed::from(POOL_SEED),
+            Seed::from(&self.authority),
+            Seed::from(&self.id),
+            Seed::from(&self.bump),
+        ]
+    }
+}
+
+/// Pull signer seeds `[PULL_SEED, pool, client_seed, bump]`.
+pub struct PullSeeds {
+    pool: Pubkey,
+    client_seed: [u8; 32],
+    bump: [u8; 1],
+}
+
+impl PullSeeds {
+    #[inline(always)]
+    pub fn as_seeds(&self) -> [Seed<'_>; 4] {
+        [
+            Seed::from(PULL_SEED),
+            Seed::from(&self.pool),
+            Seed::from(&self.client_seed),
+            Seed::from(&self.bump),
+        ]
+    }
+}
+
+/// Item signer seeds `[ITEM_SEED, pool, tier, position, bump]`.
+pub struct ItemSeeds {
+    pool: Pubkey,
+    tier: [u8; 1],
+    position: [u8; 4],
+    bump: [u8; 1],
+}
+
+impl ItemSeeds {
+    #[inline(always)]
+    pub fn as_seeds(&self) -> [Seed<'_>; 5] {
+        [
+            Seed::from(ITEM_SEED),
+            Seed::from(&self.pool),
+            Seed::from(&self.tier),
+            Seed::from(&self.position),
+            Seed::from(&self.bump),
+        ]
+    }
+}
 
 #[cold]
 fn cold_marker() {}
@@ -134,6 +194,54 @@ impl Pool {
     field!(next_index, set_next_index, next_index, u64);
     field!(next_settle, set_next_settle, next_settle, u64);
 
+    /// Write every field of a freshly created, paused pool.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub fn set_inner(
+        &mut self,
+        bump: u8,
+        authority: &Pubkey,
+        operator: &Pubkey,
+        payment_mint: &Pubkey,
+        vault: &Pubkey,
+        id: u64,
+        price: u64,
+        deadline_slots: u64,
+        bond_per_draw: u64,
+        weights: &[u32],
+    ) {
+        self.set_version(POOL_VERSION);
+        self.set_bump(bump);
+        self.set_tier_count(weights.len() as u8);
+        self.set_status(POOL_PAUSED);
+        self.set_authority(*authority);
+        self.set_operator(*operator);
+        self.set_payment_mint(*payment_mint);
+        self.set_vault(*vault);
+        self.set_id(id);
+        self.set_price(price);
+        self.set_deadline_slots(deadline_slots);
+        self.set_bond_per_draw(bond_per_draw);
+        for (tier, &weight) in self.tiers_mut().iter_mut().zip(weights) {
+            tier.set_weight(weight);
+        }
+    }
+
+    #[inline(always)]
+    pub fn seeds(authority: &Pubkey, id: u64, bump: u8) -> PoolSeeds {
+        PoolSeeds {
+            authority: *authority,
+            id: id.to_le_bytes(),
+            bump: [bump],
+        }
+    }
+
+    /// This pool's own signer seeds.
+    #[inline(always)]
+    pub fn signer_seeds(&self) -> PoolSeeds {
+        Self::seeds(self.authority(), self.id(), self.bump())
+    }
+
     #[inline]
     pub fn payment(&self, count: u64) -> Result<u64, ProgramError> {
         self.price()
@@ -169,13 +277,22 @@ impl Pool {
         &mut self.tiers[..count]
     }
 
-    /// Select among the still-available tiers in this purchase's candidate set.
+    /// One draw: a still-available tier by weight, then a rank within that
+    /// tier's remaining candidates. Rank order is by deposit position.
     #[inline(always)]
-    pub fn draw_tier(
+    pub fn draw(
         &self,
         hash: &[u8; 32],
         remaining: &[u32; MAX_TIERS],
-    ) -> Result<u8, ProgramError> {
+    ) -> Result<(u8, u32), ProgramError> {
+        let tier = self.draw_tier(hash, remaining)?;
+        let rank =
+            u64::from_le_bytes(hash[8..16].try_into().unwrap()) % remaining[tier as usize] as u64;
+        Ok((tier, rank as u32))
+    }
+
+    #[inline(always)]
+    fn draw_tier(&self, hash: &[u8; 32], remaining: &[u32; MAX_TIERS]) -> Result<u8, ProgramError> {
         let total: u64 = self
             .tiers()
             .iter()
@@ -231,9 +348,26 @@ account!(Item);
 
 impl Item {
     field!(version, set_version, version, u8);
+    field!(bump, set_bump, bump, u8);
+    /// Write every field of a freshly created item.
     #[inline(always)]
-    pub fn set_bump(&mut self, v: u8) {
-        self.bump[0] = v;
+    pub fn set_inner(&mut self, bump: u8, tier: u8, position: u32, pool: &Pubkey, asset: &Pubkey) {
+        self.set_version(ITEM_VERSION);
+        self.set_bump(bump);
+        self.set_tier(tier);
+        self.set_position(position);
+        self.set_pool(*pool);
+        self.set_asset(*asset);
+    }
+
+    #[inline(always)]
+    pub fn seeds(pool: &Pubkey, tier: u8, position: u32, bump: u8) -> ItemSeeds {
+        ItemSeeds {
+            pool: *pool,
+            tier: [tier],
+            position: position.to_le_bytes(),
+            bump: [bump],
+        }
     }
     field!(tier, set_tier, tier, u8);
     field!(position, set_position, position, u32);
@@ -262,9 +396,40 @@ account!(Pull);
 
 impl Pull {
     field!(version, set_version, version, u8);
+    field!(bump, set_bump, bump, u8);
+    /// Write every field of a freshly created, pending pull.
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    pub fn set_bump(&mut self, v: u8) {
-        self.bump[0] = v;
+    pub fn set_inner(
+        &mut self,
+        bump: u8,
+        count: u8,
+        inventory_version: u32,
+        index: u64,
+        deadline_slot: u64,
+        pool: &Pubkey,
+        buyer: &Pubkey,
+        client_seed: &[u8; 32],
+    ) {
+        self.set_version(PULL_VERSION);
+        self.set_bump(bump);
+        self.set_status(STATUS_PENDING);
+        self.set_count(count);
+        self.set_inventory_version(inventory_version);
+        self.set_index(index);
+        self.set_deadline_slot(deadline_slot);
+        self.set_pool(*pool);
+        self.set_buyer(*buyer);
+        self.set_client_seed(*client_seed);
+    }
+
+    #[inline(always)]
+    pub fn seeds(pool: &Pubkey, client_seed: &[u8; 32], bump: u8) -> PullSeeds {
+        PullSeeds {
+            pool: *pool,
+            client_seed: *client_seed,
+            bump: [bump],
+        }
     }
     field!(status, set_status, status, u8);
     field!(count, set_count, count, u8);
@@ -293,6 +458,12 @@ impl Pull {
     pub fn set_outcome(&mut self, i: usize, tier: u8, asset: &Pubkey) {
         self.outcomes[i][0] = tier;
         self.outcomes[i][1..].copy_from_slice(asset);
+    }
+
+    /// The packed `(tier, asset)` entries of the first `count` outcomes, for the event.
+    #[inline(always)]
+    pub fn outcome_bytes(&self, count: usize) -> &[u8] {
+        self.outcomes[..count].as_flattened()
     }
 
     #[inline(always)]

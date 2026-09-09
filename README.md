@@ -276,8 +276,9 @@ Fetch a Pool with `fetchPool` / `fetch_pool` and a Core Asset with `fetchAsset` 
 asset supplies its owner and collection. `withdraw(destination, amount)` builds
 a surplus withdrawal to a payment token account. Create a pool with
 `createPoolInstructions` in TypeScript or `CreatePool::instructions` in Rust;
-both include payment-vault creation. The authority must own the Core prize and
-hold the funding tokens in its payment ATA.
+both include payment-vault creation and, for a nonzero `bond`, an ordinary SPL
+transfer that funds it. The authority must own the Core prize and hold the
+funding tokens in its payment ATA.
 
 After stocking, submit `pool.setStatus('active')` in TypeScript or
 `pool.set_status(PoolStatus::Active)?` in Rust. Use `paused` / `Paused` to suspend
@@ -321,9 +322,23 @@ There is no unchecked randomness/output API.
 ### Transaction handling
 
 `buy` prepares an instruction; it does not pay until the app submits it.
-If another purchase or deposit makes it stale, resolve the old transaction's
-status first, then refetch and use a **fresh seed** for a new attempt. Do not
-share the seed with the operator before signing the purchase.
+The Pull address derives from the pool and the client seed, and the FIFO index
+is assigned when the purchase lands, so concurrent buyers never contend for one
+address. A deposit or buyback landing first still makes a prepared purchase
+stale: resolve the old transaction's status, then refetch and use a **fresh
+seed** for a new attempt. Do not share the seed with the operator before
+signing the purchase.
+
+### Events
+
+Every instruction emits one event through a CPI to the program itself, signed
+by the event authority PDA `[b"__event_authority"]`. The `Event` instruction
+accepts only that signer, so events cannot be forged by other programs and
+indexers read them from inner instructions rather than truncatable logs. Each
+event is `[255, instruction discriminator, payload]`; Buy's payload carries the
+Pull address and its FIFO index, since the queue position is not derivable
+from the address alone. Every instruction therefore ends with two accounts:
+the event authority and the program. Both SDKs append them.
 
 Settlement and delivery return ordered arrays of instructions, not signed
 transactions. Each array fits a 1,232-byte legacy transaction with the supplied
@@ -333,7 +348,10 @@ recovery: previously delivered outcomes are skipped, and a fully delivered or
 refunded Pull no longer exists. Use confirmed transaction history to distinguish
 closure from an address that was never created.
 
-Instruction layouts live beside their handlers.
+Instruction layouts and event payloads live beside their handlers. Each
+handler deserializes its accounts and its instruction data separately, with
+every check that needs only one of them living in that `TryFrom`; checks that
+need both sit at the top of `process`, which then reads as one linear story.
 
 ## License
 

@@ -11,6 +11,8 @@ export { Client } from './rpc.js';
 export const PROGRAM_ID = address('4X8u1YspRi6Z9TkZNb8qxNdwPLs5vDi7VRC2DhTheeKp');
 export const CORE_PROGRAM_ID = address('CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d');
 export const POOL_HEADER_LEN = 256;
+/** Every instruction ends with this PDA and the program; events are emitted through them. */
+export const EVENT_AUTHORITY = address('DzGCFfQ4o9bvpN3mhNmibxnf52DxBh7m7Ym8mbNqfpea');
 const TOKEN = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const SYSTEM = address('11111111111111111111111111111111');
 const ATA = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
@@ -36,7 +38,7 @@ export enum GachaError {
   InvalidTier, InvalidItem, InvalidCount, NotNextInQueue, InvalidPullStatus,
   InvalidProof, SoldOut, DeadlineNotReached, InvalidOutcome, InsufficientBalance,
   InvalidBuyer, DeadlinePassed, InventoryChanged, InvalidQuote, QuoteExpired, InvalidAsset,
-  InvalidPoolStatus, PendingPurchases,
+  InvalidPoolStatus, PendingPurchases, InvalidSeeds, AlreadyInitialized, PoolMismatch, InvalidItemCount, InvalidEventAuthority,
 }
 export interface Tier {
   readonly weight: number;
@@ -97,7 +99,8 @@ export interface CreatePool {
   readonly weights: readonly number[];
 }
 
-/** Create the vault and paused pool atomically. Authority pays ATA and pool rent. */
+/** Create the vault and paused pool atomically, then fund the vault with `bond`
+ * from the authority's payment ATA. Authority pays ATA and pool rent. */
 export async function createPoolInstructions(
   config: CreatePool,
   authority: Address,
@@ -106,7 +109,7 @@ export async function createPoolInstructions(
 ): Promise<Instruction[]> {
   const { id, price, deadlineSlots, bondPerDraw, bond } = config;
   const weights = [...config.weights];
-  const numbers = [id, price, deadlineSlots, bondPerDraw, bond].map(u64);
+  const numbers = [id, price, deadlineSlots, bondPerDraw].map(u64);
   if (
     !integer(weights.length, 1, 8)
     || weights.some(w => !integer(w, 1, 0xffffffff))
@@ -119,24 +122,19 @@ export async function createPoolInstructions(
     fail('InvalidArgument');
   }
 
-  const pool = await Pool.addressFor(authority, id);
+  const [pool, bump] = await Pool.addressFor(authority, id);
   const data = concat(
     Uint8Array.of(0),
     ...numbers,
     Uint8Array.of(weights.length),
     ...Array.from({ length: 8 }, (_, i) => u32(weights[i] ?? 0)),
+    Uint8Array.of(bump),
   );
-  const accounts = [
-    rw(authority, true),
-    rw(pool),
-    ro(operator),
-    ro(paymentMint),
-    rw(await ata(pool, paymentMint)),
-    rw(await ata(authority, paymentMint)),
-    ro(TOKEN),
-    ro(SYSTEM),
-  ];
-  return [await createAta(authority, pool, paymentMint), ix(data, accounts)];
+  const vault = await ata(pool, paymentMint);
+  const accounts = [rw(authority, true), rw(pool), ro(operator), ro(paymentMint), ro(vault), ro(SYSTEM)];
+  const instructions = [await createAta(authority, pool, paymentMint), ix(data, accounts)];
+  if (bond > 0n) instructions.push(tokenTransfer(await ata(authority, paymentMint), vault, authority, bond));
+  return instructions;
 }
 
 /** Immutable account snapshot. RPC reads and signing stay with the caller. */
@@ -148,7 +146,8 @@ export class Pool {
     this.#data = Uint8Array.from(data);
   }
 
-  static async addressFor(authority: Address, id: bigint): Promise<Address> { return pda('pool', keyBytes(authority), u64(id)); }
+  /** Address and bump; the bump travels in CreatePool's instruction data. */
+  static async addressFor(authority: Address, id: bigint): Promise<[Address, number]> { return pda('pool', keyBytes(authority), u64(id)); }
 
   /** The first 256 bytes suffice for purchases/admin; settlement needs full data.
    * Checks owner/layout/PDA, but cannot authenticate the RPC provider itself. */
@@ -178,10 +177,8 @@ export class Pool {
       }
       if (pool.tiers.some((t, i) => t.remaining !== counts[i])) fail('InvalidAccount');
     }
-    if (
-      await Pool.addressFor(pool.authority, pool.id) !== key
-      || await ata(key, pool.paymentMint) !== pool.vault
-    ) {
+    const [derived, bump] = await Pool.addressFor(pool.authority, pool.id);
+    if (derived !== key || bump !== pool.#data[1] || await ata(key, pool.paymentMint) !== pool.vault) {
       fail('InvalidAccount');
     }
     Object.freeze(pool);
@@ -243,8 +240,9 @@ export class Pool {
   async buy({ buyer, count, clientSeed }: Buy): Promise<Purchase> {
     if (this.status !== 'active') fail('InvalidPoolStatus');
     if (!integer(count, 1, 10)) fail('InvalidArgument');
-    const data = concat(Uint8Array.of(10, count), bytes(clientSeed, 32), u32(this.inventoryVersion));
-    const pull = await Pull.addressFor(this.address, this.nextIndex);
+    const seed = bytes(clientSeed, 32); // own the seed before the first await
+    const [pull, bump] = await Pull.addressFor(this.address, seed);
+    const data = concat(Uint8Array.of(10, count), seed, u32(this.inventoryVersion), Uint8Array.of(bump));
     const accounts = [
       rw(buyer, true),
       rw(this.address),
@@ -262,9 +260,9 @@ export class Pool {
     if (this.status === 'retired') fail('InvalidPoolStatus');
     if (!integer(tier, 0, this.#data[2]! - 1)) fail('InvalidArgument');
     if (asset.owner !== this.authority) fail('InvalidAsset');
-    return ix(Uint8Array.of(1, tier), [
-      rw(this.authority, true), rw(this.address),
-      rw(await Item.addressFor(this.address, tier, this.inventoryVersion)),
+    const [item, bump] = await Item.addressFor(this.address, tier, this.inventoryVersion);
+    return ix(Uint8Array.of(1, tier, bump), [
+      rw(this.authority, true), rw(this.address), rw(item),
       rw(asset.address), ro(asset.collection ?? CORE_PROGRAM_ID), ro(CORE_PROGRAM_ID), ro(SYSTEM),
     ]);
   }
@@ -278,10 +276,10 @@ export class Pool {
     if (!integer(tier, 0, this.#data[2]! - 1)) fail('InvalidArgument');
     if (quote.asset !== asset.address || asset.owner === pool) fail('InvalidAsset');
     const message = buybackMessage(quote);
-    const data = concat(Uint8Array.of(12, tier), message.slice(112, 128), bytes(signature, 64));
+    const [item, bump] = await Item.addressFor(pool, tier, this.inventoryVersion);
+    const data = concat(Uint8Array.of(12, tier), message.slice(112, 128), bytes(signature, 64), Uint8Array.of(bump));
     const accounts = [
-      rw(payer, true), ro(asset.owner, true), rw(pool),
-      rw(await Item.addressFor(pool, tier, this.inventoryVersion)),
+      rw(payer, true), ro(asset.owner, true), rw(pool), rw(item),
       rw(asset.address), ro(asset.collection ?? CORE_PROGRAM_ID),
       rw(this.vault), rw(await ata(asset.owner, this.paymentMint)),
       ro(CORE_PROGRAM_ID), ro(TOKEN), ro(SYSTEM),
@@ -372,7 +370,7 @@ export class Pool {
     }
     const draws = await Promise.all(selected.map(async draw => Object.freeze({
       ...draw,
-      item: await Item.addressFor(this.address, draw.tier, draw.position),
+      item: (await Item.addressFor(this.address, draw.tier, draw.position))[0],
     })));
     return new Settlement(this.address, pull.address, pull.buyer, this.operator, proof, draws);
   }
@@ -385,7 +383,9 @@ export class Pull {
     this.#address = key;
     this.#data = Uint8Array.from(data);
   }
-  static async addressFor(pool: Address, index: bigint): Promise<Address> { return pda('pull', keyBytes(pool), u64(index)); }
+  /** Address and bump; the bump travels in Buy's instruction data. The FIFO
+   * index is assigned on execution and recorded in the account. */
+  static async addressFor(pool: Address, clientSeed: Uint8Array): Promise<[Address, number]> { return pda('pull', keyBytes(pool), bytes(clientSeed, 32)); }
   static async fromAccount(key: Address, owner: Address, data: Uint8Array): Promise<Pull> {
     check(owner, data, 450);
     const pull = new Pull(address(key), data);
@@ -397,7 +397,8 @@ export class Pull {
         if (tier !== 255 && tier >= 8) fail('InvalidAccount');
       }
     }
-    if (await Pull.addressFor(pull.pool, pull.index) !== key) fail('InvalidAccount');
+    const [derived, bump] = await Pull.addressFor(pull.pool, pull.clientSeed);
+    if (derived !== key || bump !== d[1]) fail('InvalidAccount');
     Object.freeze(pull);
     return pull;
   }
@@ -444,18 +445,17 @@ export class Item {
     this.#address = key;
     this.#data = Uint8Array.from(data);
   }
-  static async addressFor(pool: Address, tier: number, position: number): Promise<Address> {
+  /** Address and bump; the bump travels in DepositItem's and Buyback's instruction data. */
+  static async addressFor(pool: Address, tier: number, position: number): Promise<[Address, number]> {
     if (!integer(tier, 0, 7)) fail('InvalidArgument');
     return pda('item', keyBytes(pool), Uint8Array.of(tier), u32(position));
   }
   static async fromAccount(key: Address, owner: Address, data: Uint8Array): Promise<Item> {
     check(owner, data, 72);
     const item = new Item(address(key), data);
-    if (
-      item.#data.length !== 72
-      || item.tier >= 8
-      || await Item.addressFor(item.pool, item.tier, item.position) !== key
-    ) {
+    if (item.#data.length !== 72 || item.tier >= 8) fail('InvalidAccount');
+    const [derived, bump] = await Item.addressFor(item.pool, item.tier, item.position);
+    if (derived !== key || bump !== item.#data[1]) {
       fail('InvalidAccount');
     }
     Object.freeze(item);
@@ -545,12 +545,9 @@ function u32(n: number): Uint8Array {
 }
 function keyAt(data: Uint8Array, offset: number): Address { return decoder.decode(data.subarray(offset, offset + 32)); }
 function keyBytes(key: Address): Uint8Array { return Uint8Array.from(encoder.encode(key)); }
-async function pda(seed: string, ...seeds: Uint8Array[]): Promise<Address> {
-  const [key] = await getProgramDerivedAddress({
-    programAddress: PROGRAM_ID,
-    seeds: [seed, ...seeds],
-  });
-  return key;
+async function pda(seed: string, ...seeds: Uint8Array[]): Promise<[Address, number]> {
+  const [key, bump] = await getProgramDerivedAddress({ programAddress: PROGRAM_ID, seeds: [seed, ...seeds] });
+  return [key, bump];
 }
 async function ata(owner: Address, mint: Address): Promise<Address> {
   const [key] = await getProgramDerivedAddress({
@@ -567,13 +564,18 @@ function ro(key: Address, signer = false): AccountMeta {
   const role = signer ? AccountRole.READONLY_SIGNER : AccountRole.READONLY;
   return { address: address(key), role };
 }
-function ix(data: Uint8Array, accounts: AccountMeta[]): Instruction { return { programAddress: PROGRAM_ID, data, accounts }; }
+/** Every instruction ends with the event authority and the program, for the event CPI. */
+function ix(data: Uint8Array, accounts: AccountMeta[]): Instruction { return { programAddress: PROGRAM_ID, data, accounts: [...accounts, ro(EVENT_AUTHORITY), ro(PROGRAM_ID)] }; }
 function deliver(pool: Address, pull: Address, buyer: Address, asset: Asset, outcome: number, payer: Address): Instruction {
   if (asset.owner !== pool) fail('InvalidAsset');
   return ix(Uint8Array.of(21, outcome), [
     rw(payer, true), ro(pool), rw(pull), rw(buyer), rw(asset.address),
     ro(asset.collection ?? CORE_PROGRAM_ID), ro(CORE_PROGRAM_ID), ro(SYSTEM),
   ]);
+}
+/** SPL Token `Transfer`; collateral enters the vault as an ordinary transfer. */
+function tokenTransfer(from: Address, to: Address, authority: Address, amount: bigint): Instruction {
+  return { programAddress: TOKEN, data: concat(Uint8Array.of(3), u64(amount)), accounts: [rw(from), rw(to), ro(authority, true)] };
 }
 async function createAta(payer: Address, owner: Address, mint: Address): Promise<Instruction> {
   const accounts = [

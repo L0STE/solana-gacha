@@ -9,10 +9,6 @@ repository = "https://github.com/L0STE/solana-gacha"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
 
-[features]
-default = []
-ix-logs = []
-
 [lib]
 crate-type = ["cdylib"]
 

@@ -8,23 +8,40 @@
 //! deposits. Rotate pools or introduce paged indexes if the 10 MiB account limit
 //! becomes relevant (roughly 6.99 million lifetime deposits per pool).
 
-use crate::{constants::MAX_TIERS, errors::GachaError};
-use pinocchio::program_error::ProgramError;
+use crate::{
+    constants::{MAX_TIERS, POOL_LEN},
+    errors::GachaError,
+    state::{Item, Load, Pool, Pull},
+};
+use pinocchio::{
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+};
 
-pub(crate) use crate::constants::inventory_space as space;
+pub use crate::constants::inventory_space as space;
 use crate::constants::{
     INVENTORY_BLOCK_LEN as BLOCK_LEN, INVENTORY_COUNTS_LEN as COUNTS_LEN,
     INVENTORY_TAGS_PER_BLOCK as POSITIONS_PER_BLOCK,
 };
 
-pub(crate) struct Inventory<'a> {
+pub struct Inventory<'a> {
     data: &'a mut [u8],
 }
 
 impl<'a> Inventory<'a> {
     /// The caller validates the pool length against its position count.
-    pub(crate) fn new(data: &'a mut [u8]) -> Self {
+    pub fn new(data: &'a mut [u8]) -> Self {
         Self { data }
+    }
+
+    /// View the pool's availability index after validating the pool. It lives
+    /// past the fixed header, so it can be held alongside `Pool::load_mut`.
+    #[inline(always)]
+    pub fn load(pool_account: &'a AccountInfo) -> Result<Self, ProgramError> {
+        Pool::load(pool_account)?;
+        // SAFETY: validated just above; the index bytes never overlap the header
+        // a `Pool` view covers.
+        let data = unsafe { pool_account.borrow_mut_data_unchecked() };
+        Ok(Self::new(&mut data[POOL_LEN..]))
     }
 
     fn blocks(&self) -> usize {
@@ -42,6 +59,8 @@ impl<'a> Inventory<'a> {
         self.data[start..start + 4].copy_from_slice(&count.to_le_bytes());
     }
 
+    // Node-outer, tier-inner: walking the Fenwick chain once per tier instead
+    // measured 3,400 CU worse on a ten-draw settle; the 32-byte zero fill is cheaper.
     fn prefix_counts(&self, mut blocks: usize) -> [u32; MAX_TIERS] {
         let mut counts = [0; MAX_TIERS];
         while blocks > 0 {
@@ -53,7 +72,7 @@ impl<'a> Inventory<'a> {
         counts
     }
 
-    pub(crate) fn counts(&self, cutoff: u32) -> [u32; MAX_TIERS] {
+    pub fn counts(&self, cutoff: u32) -> [u32; MAX_TIERS] {
         let blocks = cutoff as usize / POSITIONS_PER_BLOCK;
         let tail = cutoff as usize % POSITIONS_PER_BLOCK;
         let mut counts = self.prefix_counts(blocks);
@@ -70,7 +89,7 @@ impl<'a> Inventory<'a> {
 
     /// `position` is the pool's next never-reused index. Any new block has
     /// already been zero-extended by DepositItem.
-    pub(crate) fn append(&mut self, position: u32, tier: u8) {
+    pub fn append(&mut self, position: u32, tier: u8) {
         let block = position as usize / POSITIONS_PER_BLOCK;
         let offset = position as usize % POSITIONS_PER_BLOCK;
         let mut node = block + 1;
@@ -91,7 +110,7 @@ impl<'a> Inventory<'a> {
 
     /// Remove the zero-based `rank`th available prize in `tier`. The caller
     /// bounds rank by counts(cutoff), so the selected position is < cutoff.
-    pub(crate) fn take(&mut self, tier: u8, mut rank: u32) -> Result<u32, ProgramError> {
+    pub fn take(&mut self, tier: u8, mut rank: u32) -> Result<u32, ProgramError> {
         let blocks = self.blocks();
         let mut node = 0;
         // Skip whole blocks whose available prizes precede the requested rank.
@@ -132,7 +151,7 @@ impl<'a> Inventory<'a> {
     }
 
     /// Remove one known unsold position during retirement.
-    pub(crate) fn remove(&mut self, position: u32, tier: u8) -> Result<(), ProgramError> {
+    pub fn remove(&mut self, position: u32, tier: u8) -> Result<(), ProgramError> {
         let block = position as usize / POSITIONS_PER_BLOCK;
         let offset = position as usize % POSITIONS_PER_BLOCK;
         let tag = self
@@ -154,64 +173,93 @@ impl<'a> Inventory<'a> {
     }
 }
 
-/// Append one custody-backed prize at a fresh position. Payer funds item and index rent.
-pub(crate) fn restock(
-    payer: &pinocchio::account_info::AccountInfo,
-    pool_account: &pinocchio::account_info::AccountInfo,
-    item_account: &pinocchio::account_info::AccountInfo,
-    asset: &pinocchio::pubkey::Pubkey,
-    tier: u8,
-) -> pinocchio::ProgramResult {
-    use crate::{
-        constants::*,
-        helpers::create_pda,
-        state::{Item, Pool},
-    };
-    use pinocchio::{
-        instruction::Seed,
-        pubkey::find_program_address,
-        sysvars::{rent::Rent, Sysvar},
-    };
-    let pool = unsafe { Pool::from_bytes_unchecked(pool_account.borrow_data_unchecked()) };
-    if pool.status() == POOL_RETIRED {
-        return Err(GachaError::InvalidPoolStatus.into());
+/// Settle every draw of `pull` from the verified VRF output: pick a tier by
+/// weight and an item by rank within the pull's pinned prefix, record the
+/// award, and close the Item to the operator. Each passed Item must be the one
+/// its draw selected.
+pub fn draw(
+    pool: &mut Pool,
+    mut inventory: Inventory,
+    pull: &mut Pull,
+    pool_key: &Pubkey,
+    items: &[AccountInfo],
+    operator: &AccountInfo,
+    beta: &[u8; 64],
+) -> ProgramResult {
+    use crate::helpers::{close, sha256};
+    // Only our own draws reduce the eligible stock during this instruction
+    let mut available = inventory.counts(pull.inventory_version());
+    for (i, item_account) in items.iter().enumerate() {
+        let hash = sha256(&[beta, &[i as u8]]);
+        let (tier, rank) = pool.draw(&hash, &available)?;
+        let position = inventory.take(tier, rank)?;
+        available[tier as usize] -= 1;
+
+        let item = Item::load(item_account)?;
+        if item.pool().ne(pool_key) || item.tier().ne(&tier) || item.position().ne(&position) {
+            return Err(GachaError::InvalidItem.into());
+        }
+
+        pull.set_outcome(i, tier, item.asset());
+        close(item_account, operator)?;
+        let selected = &mut pool.tiers_mut()[tier as usize];
+        selected.set_remaining(selected.remaining() - 1);
     }
+    Ok(())
+}
+
+/// The pool accepts stock in `tier` and `item_account` is the empty PDA for
+/// the pool's next position. Returns the position.
+/// Positions are u32: the account-size ceiling is reached long before overflow.
+pub fn check_restock(
+    pool: &Pool,
+    pool_key: &Pubkey,
+    item_account: &AccountInfo,
+    tier: u8,
+    bump: u8,
+) -> Result<u32, ProgramError> {
+    use crate::{constants::ITEM_SEED, helpers::check_uninitialized};
+    use pinocchio::pubkey::create_program_address;
     if tier >= pool.tier_count() {
         return Err(GachaError::InvalidTier.into());
     }
     let position = pool.inventory_version();
-    let next_position = position
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    let remaining = pool.tiers()[tier as usize]
-        .remaining()
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    let tier_seed = [tier];
-    let position_seed = position.to_le_bytes();
-    let (item_key, bump) = find_program_address(
-        &[ITEM_SEED, pool_account.key(), &tier_seed, &position_seed],
-        &crate::ID,
-    );
-    if item_key.ne(item_account.key()) {
-        return Err(GachaError::InvalidItem.into());
-    }
-    let bump_seed = [bump];
-    create_pda(
-        payer,
-        item_account,
-        ITEM_LEN,
+    let key = create_program_address(
         &[
-            Seed::from(ITEM_SEED),
-            Seed::from(pool_account.key()),
-            Seed::from(&tier_seed),
-            Seed::from(&position_seed),
-            Seed::from(&bump_seed),
+            ITEM_SEED,
+            pool_key,
+            &[tier],
+            &position.to_le_bytes(),
+            &[bump],
         ],
-    )?;
+        &crate::ID,
+    )
+    .map_err(|_| GachaError::InvalidSeeds)?;
+    if key.ne(item_account.key()) {
+        return Err(GachaError::InvalidSeeds.into());
+    }
+    check_uninitialized(item_account)?;
+    Ok(position)
+}
 
-    let space = POOL_LEN + space(next_position);
+/// Append one custody-backed prize at the pool's next position. Payer funds
+/// item and index rent. Callers run `check_restock` first.
+pub fn restock(
+    payer: &AccountInfo,
+    pool_account: &AccountInfo,
+    item_account: &AccountInfo,
+    asset: &Pubkey,
+    tier: u8,
+    bump: u8,
+) -> ProgramResult {
+    use crate::{constants::ITEM_LEN, helpers::create_pda};
+    use pinocchio::sysvars::{rent::Rent, Sysvar};
+    // Take the next position and grow the index first, so the pool's length and
+    // version stay consistent for every view taken below.
+    let pool = Pool::load_mut(pool_account)?;
+    let position = pool.inventory_version();
+    pool.set_inventory_version(position + 1);
+    let space = POOL_LEN + space(position + 1);
     if space != pool_account.data_len() {
         let missing = Rent::get()?
             .minimum_balance(space)
@@ -227,21 +275,18 @@ pub(crate) fn restock(
         pool_account.realloc(space, false)?;
     }
 
-    let item = unsafe { Item::from_bytes_unchecked_mut(item_account.borrow_mut_data_unchecked()) };
-    item.set_version(ITEM_VERSION);
-    item.set_bump(bump);
-    item.set_tier(tier);
-    item.set_position(position);
-    item.set_pool(*pool_account.key());
-    item.set_asset(*asset);
+    // Create and populate the Item
+    let seeds = Item::seeds(pool_account.key(), tier, position, bump);
+    create_pda(payer, item_account, ITEM_LEN, &seeds.as_seeds())?;
+    let item = Item::load_new(item_account)?;
+    item.set_inner(bump, tier, position, pool_account.key(), asset);
 
-    let data = unsafe { pool_account.borrow_mut_data_unchecked() };
-    let (header, index) = data.split_at_mut(POOL_LEN);
-    let pool = unsafe { Pool::from_bytes_unchecked_mut(header) };
-    Inventory::new(index).append(position, tier);
-    pool.set_inventory_version(next_position);
+    // Make the position available
+    let pool = Pool::load_mut(pool_account)?;
+    let mut inventory = Inventory::load(pool_account)?;
+    inventory.append(position, tier);
     let tier = &mut pool.tiers_mut()[tier as usize];
-    tier.set_remaining(remaining);
+    tier.set_remaining(tier.remaining() + 1);
     Ok(())
 }
 

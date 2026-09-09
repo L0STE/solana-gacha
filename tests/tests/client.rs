@@ -32,6 +32,18 @@ fn account(f: &Fixture, key: Pubkey) -> Value {
     json!({"address": key.to_string(), "owner": f.account(&key).owner.to_string(), "data": hex(&f.account(&key).data)})
 }
 
+#[test]
+fn event_authority_constants_are_the_canonical_derivation() {
+    use gacha_core::constants::{EVENT_AUTHORITY, EVENT_AUTHORITY_BUMP, EVENT_AUTHORITY_SEED};
+    assert_eq!(
+        Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PROGRAM_ID),
+        (
+            Pubkey::new_from_array(EVENT_AUTHORITY),
+            EVENT_AUTHORITY_BUMP
+        )
+    );
+}
+
 /// Executable source of the TypeScript parity vector. To regenerate its JSON:
 /// GACHA_PRINT_VECTOR=1 cargo test -p gacha-tests --test client -- --nocapture
 #[test]
@@ -113,7 +125,7 @@ fn client_flow_and_trust_boundaries() {
         })
         .unwrap();
     assert_eq!(buy.instruction, f.buy_ix(10, [7; 32]));
-    assert_eq!(buy.pull, pull_pda(&f.pool, 0));
+    assert_eq!(buy.pull, pull_pda(&f.pool, &[7; 32]));
     assert!(f.run(&buy.instruction).program_result.is_ok());
     assert!(f.deposit(2).program_result.is_ok()); // Not eligible for this purchase.
     let pending_pool = account(&f, f.pool);
@@ -221,7 +233,7 @@ fn client_flow_and_trust_boundaries() {
     let retire = f.client_pool().set_status(PoolStatus::Retired).unwrap();
     assert!(f.run(&retire).program_result.is_ok());
     let retired_pool = account(&f, f.pool);
-    let item_key = Item::address_for(f.pool, quote.tier, f.client_pool().inventory_version() - 1);
+    let item_key = Item::address_for(f.pool, quote.tier, f.client_pool().inventory_version() - 1).0;
     let reclaim_item = account(&f, item_key);
     let reclaim_asset = account(&f, quote.asset);
     let reclaim = f

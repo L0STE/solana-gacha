@@ -14,6 +14,7 @@ fn retirement_preserves_purchases_and_recovers_only_unsold_assets() {
 
     let mut f = Fixture::new();
     assert!(f.run(&f.create_pool_ix()).program_result.is_ok());
+    assert!(f.run(&f.fund_ix(BOND)).program_result.is_ok());
     assert_eq!(f.client_pool().status(), PoolStatus::Paused);
     for tier in [0, 1, 2, 0] {
         assert!(f.deposit(tier).program_result.is_ok());
@@ -71,6 +72,8 @@ fn retirement_preserves_purchases_and_recovers_only_unsold_assets() {
             AccountMeta::new_readonly(CORE, false),
             AccountMeta::new_readonly(CORE, false),
             AccountMeta::new_readonly(SYSTEM, false),
+            AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
         ],
     );
     assert_eq!(
@@ -169,11 +172,9 @@ fn deposit_rejects_spl_tokens_as_prizes() {
     let before =
         [f.pool, ix.accounts[2].pubkey, f.payment_mint].map(|key| (key, f.account(&key).clone()));
     let payer = f.authority;
+    // Core rejects a non-asset account; the program passes it through unchecked.
     let result = f.run_transaction(&[ix], &payer);
-    assert_eq!(
-        result.program_result,
-        TransactionProgramResult::Failure(0, ProgramError::Custom(GachaError::InvalidAsset as u32))
-    );
+    assert!(result.raw_result.is_err());
     for (key, account) in before {
         assert_eq!(result.get_account(&key), Some(&account));
     }
@@ -264,6 +265,33 @@ fn refund_recreates_a_closed_payment_ata_and_advances_queue() {
     // The next pull settles normally after the gap.
     let (pull, _) = f.buy(1, seeded(5));
     assert!(f.settle(&pull).0.program_result.is_ok());
+}
+
+#[test]
+fn concurrent_buyers_from_one_snapshot_all_land_in_fifo_order() {
+    let mut f = Fixture::new();
+    assert!(f.open_pool().program_result.is_ok());
+    for _ in 0..3 {
+        assert!(f.deposit(0).program_result.is_ok());
+    }
+    // Three buyers read next_index = 0; none can know the others' order.
+    let prepared: Vec<_> = (1..=3).map(|n| f.buy_ix(1, seeded(n))).collect();
+    for (n, ix) in prepared.iter().enumerate() {
+        assert!(f.run(ix).program_result.is_ok(), "buyer {n}");
+        let pull = f.client_pull(&pull_pda(&f.pool, &seeded(n as u8 + 1)));
+        assert_eq!(pull.index(), n as u64);
+    }
+    // Reusing a disclosed seed cannot replace an existing purchase.
+    assert!(f.run(&prepared[0]).program_result.is_err());
+    assert_eq!(f.pool_u64(OFF_NEXT_INDEX), 3);
+    for n in 1..=3 {
+        assert!(f
+            .settle(&pull_pda(&f.pool, &seeded(n)))
+            .0
+            .program_result
+            .is_ok());
+    }
+    assert_eq!(f.pool_u64(OFF_NEXT_SETTLE), 3);
 }
 
 #[test]
@@ -372,17 +400,7 @@ fn collateral_covers_every_pending_refund_and_can_be_funded_by_token_transfer() 
     assert_eq!(f.pool_u64(OFF_PENDING_DRAWS), 0);
 
     // Ordinary SPL Transfer into the vault replenishes the timeout collateral.
-    let mut data = vec![3];
-    data.extend(BOND_PER_DRAW.to_le_bytes());
-    let fund = solana_instruction::Instruction::new_with_bytes(
-        TOKEN,
-        &data,
-        vec![
-            solana_instruction::AccountMeta::new(ata(&f.authority, &f.payment_mint), false),
-            solana_instruction::AccountMeta::new(f.vault, false),
-            solana_instruction::AccountMeta::new_readonly(f.authority, true),
-        ],
-    );
+    let fund = f.fund_ix(BOND_PER_DRAW);
     assert!(f.run(&fund).program_result.is_ok());
     let (pull, result) = f.buy(1, seeded(4));
     assert!(result.program_result.is_ok());
@@ -403,7 +421,7 @@ fn prefunded_pool_item_and_pull_accounts_initialize_normally() {
     assert!(f.open_pool().program_result.is_ok());
     f.upsert(item_pda(&f.pool, 0, 0), wallet(1));
     assert!(f.deposit(0).program_result.is_ok());
-    let pull = pull_pda(&f.pool, 0);
+    let pull = pull_pda(&f.pool, &seeded(1));
     // Already fully funded; initialization must not overcharge its payer.
     f.upsert(pull, wallet(10_000_000));
     let before = f.account(&f.buyer).lamports;
@@ -462,13 +480,6 @@ fn invalid_prices_penalties_deadlines_and_vrf_keys_are_rejected() {
             Some(GachaError::InvalidPoolParams as u32)
         );
     }
-    let mut f = Fixture::new();
-    let mut ix = f.create_pool_ix();
-    ix.accounts[2].pubkey = SYSTEM;
-    assert_eq!(
-        custom_error(&f.run(&ix)),
-        Some(GachaError::InvalidOperator as u32)
-    );
 }
 
 #[test]
@@ -487,7 +498,6 @@ fn overflowing_deadline_or_purchase_index_is_rejected() {
     let mut pool = f.account(&f.pool).clone();
     pool.data[OFF_NEXT_INDEX..OFF_NEXT_INDEX + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     f.upsert(f.pool, pool);
-    f.next_index = u64::MAX;
     assert!(f.buy(1, seeded(1)).1.program_result.is_err());
 }
 
@@ -702,7 +712,11 @@ fn signed_inventory_version_rejects_restocking_before_payment_and_client_rebuild
         })
         .unwrap();
     assert!(f.run(&fresh.instruction).program_result.is_ok());
-    assert!(f.settle(&pull_pda(&f.pool, 0)).0.program_result.is_ok());
+    assert!(f
+        .settle(&pull_pda(&f.pool, &seeded(32)))
+        .0
+        .program_result
+        .is_ok());
 }
 
 #[test]
@@ -716,11 +730,9 @@ fn failed_deposit_rolls_back_inventory_growth_version_and_rent() {
     f.upsert(ix.accounts[3].pubkey, core_asset(&f.buyer, None));
     let before = f.account(&f.pool).clone();
     let payer = f.authority;
+    // Core rejects a transfer the authority does not own; the restock rolls back with it.
     let result = f.run_transaction(&[ix], &payer);
-    assert_eq!(
-        result.program_result,
-        TransactionProgramResult::Failure(0, ProgramError::Custom(GachaError::InvalidAsset as u32))
-    );
+    assert!(result.raw_result.is_err());
     assert_eq!(result.get_account(&f.pool), Some(&before));
     assert!(f.deposit(1).program_result.is_ok());
     assert_eq!(f.account(&f.pool).data.len(), before.data.len() + 96);
@@ -765,10 +777,7 @@ fn core_collection_rules_apply_to_custody_and_delivery() {
         let deposit = f.client_pool().deposit(0, &snapshot).unwrap();
         let mut wrong_collection = deposit.clone();
         wrong_collection.accounts[4].pubkey = CORE;
-        assert_eq!(
-            custom_error(&f.run(&wrong_collection)),
-            Some(GachaError::InvalidAsset as u32)
-        );
+        assert!(f.run(&wrong_collection).program_result.is_err());
         f.ensure(&deposit);
         let before =
             [f.pool, asset, deposit.accounts[2].pubkey].map(|key| (key, f.account(&key).clone()));

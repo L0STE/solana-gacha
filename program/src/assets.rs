@@ -1,7 +1,4 @@
-use gacha_core::{
-    asset::{CoreAsset, CORE_ID},
-    errors::GachaError,
-};
+use gacha_core::asset::CORE_ID;
 use pinocchio::{
     account_info::AccountInfo,
     cpi::invoke_signed,
@@ -9,9 +6,10 @@ use pinocchio::{
     ProgramResult,
 };
 
-/// Core TransferV1 with no compression proof. The owner must authorize every
-/// custody change; Core enforces collection and plugin rules in its own program.
-pub(crate) struct Transfer<'a> {
+/// Core TransferV1 with no compression proof. Core validates the asset, its
+/// owner's signature, the collection account and plugin rules itself, so the
+/// program passes the accounts through unchecked.
+pub struct Transfer<'a> {
     pub payer: &'a AccountInfo,
     pub authority: &'a AccountInfo,
     pub new_owner: &'a AccountInfo,
@@ -23,18 +21,6 @@ pub(crate) struct Transfer<'a> {
 
 impl Transfer<'_> {
     pub fn invoke_signed(self, signers: &[Signer]) -> ProgramResult {
-        if self.core_program.key() != &CORE_ID || self.system_program.key() != &pinocchio_system::ID
-        {
-            return Err(GachaError::InvalidAsset.into());
-        }
-        let data = unsafe { self.asset.borrow_data_unchecked() };
-        let asset = CoreAsset::from_account(unsafe { self.asset.owner() }, data)?;
-        if asset.owner != self.authority.key()
-            || self.new_owner.key() == self.authority.key()
-            || self.collection.key() != asset.collection.unwrap_or(&CORE_ID)
-        {
-            return Err(GachaError::InvalidAsset.into());
-        }
         let accounts = [
             AccountMeta::writable(self.asset.key()),
             AccountMeta::readonly(self.collection.key()),

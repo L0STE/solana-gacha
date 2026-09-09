@@ -3,7 +3,11 @@ use pinocchio::program_error::ProgramError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GachaError {
-    /// Account expected to be mutable
+    /// An account this program writes directly (data, or lamports in `close`)
+    /// must be writable. The runtime would reject the write at the end of the
+    /// instruction, after every CPI ran; checking first fails early and
+    /// clearly. Accounts mutated only through a CPI are not checked: the CPI
+    /// enforces it.
     NotMutable,
     /// Account expected to be a signer
     NotSigner,
@@ -61,6 +65,16 @@ pub enum GachaError {
     InvalidPoolStatus,
     /// Resolve pending purchases before reclaiming unsold inventory.
     PendingPurchases,
+    /// The account is not the PDA for the supplied seeds and bump.
+    InvalidSeeds,
+    /// The account to create already holds data or is not system-owned.
+    AlreadyInitialized,
+    /// The pull belongs to a different pool.
+    PoolMismatch,
+    /// Settlement needs exactly one item account per draw.
+    InvalidItemCount,
+    /// Only the event authority PDA may invoke the event instruction.
+    InvalidEventAuthority,
 }
 
 impl From<GachaError> for ProgramError {

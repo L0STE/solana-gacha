@@ -10,8 +10,21 @@ pub const POOL_RETIRED: u8 = 2;
 pub const POOL_SEED: &[u8] = b"pool";
 /// Item PDA: [ITEM_SEED, pool, tier (u8), global deposit position (u32 LE)].
 pub const ITEM_SEED: &[u8] = b"item";
-/// Pull PDA: [PULL_SEED, pool, index (u64 LE)].
+/// Pull PDA: [PULL_SEED, pool, client_seed]. The FIFO index is assigned on
+/// execution, so concurrent purchases never contend for one address.
 pub const PULL_SEED: &[u8] = b"pull";
+/// Event authority PDA: [EVENT_AUTHORITY_SEED]. Every instruction emits one
+/// event by invoking the program itself with this PDA as signer, so events
+/// live in inner instructions and cannot be spoofed by other programs.
+pub const EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+// DzGCFfQ4o9bvpN3mhNmibxnf52DxBh7m7Ym8mbNqfpea; the test below re-derives it.
+pub const EVENT_AUTHORITY: [u8; 32] = [
+    192, 247, 135, 119, 0, 6, 222, 140, 33, 33, 148, 202, 138, 73, 98, 34, 75, 178, 173, 186, 91,
+    23, 18, 107, 166, 29, 116, 219, 149, 151, 122, 175,
+];
+pub const EVENT_AUTHORITY_BUMP: u8 = 254;
+/// Self-CPI event instruction discriminator.
+pub const EVENT_DISCRIMINATOR: u8 = 255;
 
 pub const MAX_TIERS: usize = 8;
 /// Draws per pull. Bounds the outcome table in `Pull` and the item accounts a

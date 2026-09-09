@@ -1,15 +1,13 @@
-use crate::constants::*;
+use crate::constants::{MAX_COUNT, POOL_ACTIVE, PULL_LEN, PULL_SEED};
 use crate::errors::GachaError;
-use crate::helpers::{create_pda, token_account};
-use crate::state::{Pool, Pull};
-use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Seed,
-    program_error::ProgramError,
-    pubkey::find_program_address,
-    sysvars::{clock::Clock, Sysvar},
-    ProgramResult,
-};
+use crate::events::BuyEvent;
+use crate::helpers::{check_uninitialized, create_pda, TokenAccount};
+use crate::state::{Load, Pool, Pull};
+use core::mem::size_of;
+use pinocchio::log::sol_log;
+use pinocchio::pubkey::create_program_address;
+use pinocchio::sysvars::{clock::Clock, Sysvar};
+use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};
 use pinocchio_token::instructions::Transfer;
 
 /// # Buy
@@ -19,172 +17,250 @@ use pinocchio_token::instructions::Transfer;
 /// compute it once the seed is known. The signed inventory version pins the
 /// candidate list before that seed is shared; later deposits cannot enter it.
 ///
+/// > Create the Pull account at its seed-derived PDA
+/// > Record buyer, seed, pinned inventory version, FIFO index and deadline
+/// > Reserve the draws and transfer the payment into the vault
+///
 /// Accounts:
 ///
-/// 1. buyer:          [signer, mut]   pays rent and the price
-/// 2. pool:           [mut]
-/// 3. pull:           [mut]           PDA [PULL_SEED, pool, next_index]
-/// 4. buyer_ata:      [mut]
-/// 5. vault:          [mut]
-/// 6. token_program:  [executable]
-/// 7. system_program: [executable]
+/// 1. buyer:               [signer, mut]   pays rent and the price
+/// 2. pool:                [mut]
+/// 3. pull:                [mut]           PDA [PULL_SEED, pool, client_seed]
+/// 4. buyer_ata:           [mut]
+/// 5. vault:               [mut]
+/// 6. token_program:       [executable]
+/// 7. system_program:      [executable]
+/// 8. event_authority:
+/// 9. program:             [executable]    this program, for the event CPI
 ///
 /// Parameters:
 /// 1. count: u8,
 /// 2. client_seed: [u8; 32],
-/// 3. inventory_version: u32, // expected deposit count, read before signing
+/// 3. inventory_version: u32,      // expected deposit count, read before signing
+/// 4. bump: u8,                    // pull PDA bump, one fixed-cost derivation
+///
+/// Note: The FIFO index is assigned here, at execution, so concurrent buyers never
+/// contend for one Pull address.
 ///
 /// Account Checks:
 /// - Buyer: signer
-/// - Pool: Pool::check; writable
-/// - Pull: must be the PDA for (pool, next_index); created here
-/// - Vault: equals pool.vault
-/// - Buyer ATA: the transfer fails on a wrong mint or owner
+/// - Pool: writable, deserialized, active
+/// - Pull: writable, empty system account; the PDA check needs the seed, so it runs in process
+/// - BuyerAta: no need to check since the transfer fails on a wrong mint or owner
+/// - Vault: equal to pool.vault
+/// - EventAuthority, Program: no need to check since the event CPI fails otherwise
 ///
 /// Instruction Checks:
-/// - 1 ≤ count ≤ 10; enough unreserved stock and funded timeout penalties
-pub(crate) struct Buy<'a> {
-    buyer: &'a AccountInfo,
-    pool: &'a AccountInfo,
-    pull: &'a AccountInfo,
-    buyer_ata: &'a AccountInfo,
-    vault: &'a AccountInfo,
-    count: u8,
-    client_seed: &'a [u8; 32],
-    index: u64,
-    next_index: u64,
-    pending_draws: u64,
-    amount: u64,
-    deadline_slot: u64,
-    bump: u8,
+/// - Count: 1 ≤ count ≤ 10
+/// - InventoryVersion, stock and collateral: need the pool, so they run in process
+///
+/// Event Data:
+/// - discriminator: u8, (255u8, 10u8)
+/// - pool: Pubkey,
+/// - pull: Pubkey,
+/// - buyer: Pubkey,
+/// - index: u64,
+/// - count: u8,
+pub struct BuyAccounts<'a> {
+    pub buyer: &'a AccountInfo,
+    pub pool: &'a AccountInfo,
+    pub pull: &'a AccountInfo,
+    pub buyer_ata: &'a AccountInfo,
+    pub vault: &'a AccountInfo,
+    pub event_authority: &'a AccountInfo,
+    pub program: &'a AccountInfo,
 }
 
-impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Buy<'a> {
+impl<'a> TryFrom<&'a [AccountInfo]> for BuyAccounts<'a> {
     type Error = ProgramError;
 
-    fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
-        #[cfg(feature = "ix-logs")]
-        pinocchio::log::sol_log("Buy");
-
-        let [buyer, pool, pull, buyer_ata, vault, _token_program, _system_program] = accounts
+    fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
+        let [buyer, pool, pull, buyer_ata, vault, _token_program, _system_program, event_authority, program] =
+            accounts
         else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
+
+        // Account Checks
         if !buyer.is_signer() {
             return Err(GachaError::NotSigner.into());
         }
         if !pool.is_writable() || !pull.is_writable() {
             return Err(GachaError::NotMutable.into());
         }
-        crate::state::check_pool(pool)?;
-        let header = unsafe { Pool::from_bytes_unchecked(pool.borrow_data_unchecked()) };
-        if header.vault().ne(vault.key()) {
-            return Err(GachaError::InvalidTokenAddress.into());
-        }
-        if data.len() != 37 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let count = data[0];
-        let client_seed = data[1..33].try_into().unwrap();
-        let inventory_version = u32::from_le_bytes(data[33..37].try_into().unwrap());
-        if header.status() != POOL_ACTIVE {
+        check_uninitialized(pull)?;
+
+        let pool_data = Pool::load(pool)?;
+        if pool_data.status().ne(&POOL_ACTIVE) {
             return Err(GachaError::InvalidPoolStatus.into());
         }
-        if count == 0 || count as usize > MAX_COUNT {
-            return Err(GachaError::InvalidCount.into());
-        }
-        if inventory_version != header.inventory_version() {
-            return Err(GachaError::InventoryChanged.into());
-        }
-        let index = header.next_index();
-        let pending_draws = header
-            .pending_draws()
-            .checked_add(count as u64)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        // FIFO makes candidate prefixes nested: every older pending draw can
-        // consume at most one item in this prefix, so this also reserves enough
-        // eligible stock for this purchase even if no further deposits arrive.
-        if pending_draws > header.remaining() {
-            return Err(GachaError::SoldOut.into());
-        }
-        let amount = header.payment(count as u64)?;
-        let (_, _, vault_balance) = token_account(vault)?;
-        let funded_balance = vault_balance
-            .checked_add(amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        if funded_balance < header.refund_amount(pending_draws)? {
-            return Err(GachaError::InsufficientBalance.into());
-        }
-        let next_index = index
-            .checked_add(1)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        let deadline_slot = Clock::get()?
-            .slot
-            .checked_add(header.deadline_slots())
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        let (pull_key, bump) =
-            find_program_address(&[PULL_SEED, pool.key(), &index.to_le_bytes()], &crate::ID);
-        if pull_key.ne(pull.key()) {
-            return Err(GachaError::InvalidAccountOwner.into());
+        if pool_data.vault().ne(vault.key()) {
+            return Err(GachaError::InvalidTokenAddress.into());
         }
 
+        // Return the accounts
         Ok(Self {
             buyer,
             pool,
             pull,
             buyer_ata,
             vault,
+            event_authority,
+            program,
+        })
+    }
+}
+
+pub struct BuyInstructionData<'a> {
+    pub count: u8,
+    pub client_seed: &'a [u8; 32],
+    pub inventory_version: u32,
+    pub bump: u8,
+}
+
+impl<'a> TryFrom<&'a [u8]> for BuyInstructionData<'a> {
+    type Error = ProgramError;
+
+    fn try_from(data: &'a [u8]) -> Result<Self, Self::Error> {
+        if data
+            .len()
+            .ne(&(size_of::<u8>() + size_of::<[u8; 32]>() + size_of::<u32>() + size_of::<u8>()))
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let count = data[0];
+        let client_seed = data[1..33].try_into().unwrap();
+        let inventory_version = u32::from_le_bytes(data[33..37].try_into().unwrap());
+        let bump = data[37];
+
+        // Instruction Checks
+        if count == 0 || count as usize > MAX_COUNT {
+            return Err(GachaError::InvalidCount.into());
+        }
+
+        Ok(Self {
             count,
             client_seed,
-            index,
-            next_index,
-            pending_draws,
-            amount,
-            deadline_slot,
+            inventory_version,
             bump,
         })
     }
 }
 
-impl Buy<'_> {
-    pub(crate) const DISCRIMINATOR: u8 = 10;
+pub struct Buy<'a> {
+    pub accounts: BuyAccounts<'a>,
+    pub instruction_data: BuyInstructionData<'a>,
+}
 
-    pub(crate) fn process(self) -> ProgramResult {
-        let index_seed = self.index.to_le_bytes();
-        let bump_seed = [self.bump];
-        create_pda(
-            self.buyer,
-            self.pull,
-            PULL_LEN,
+impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Buy<'a> {
+    type Error = ProgramError;
+
+    fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
+        sol_log("Buy");
+
+        let accounts = BuyAccounts::try_from(accounts)?;
+        let instruction_data = BuyInstructionData::try_from(data)?;
+
+        // Return the initialized struct
+        Ok(Self {
+            accounts,
+            instruction_data,
+        })
+    }
+}
+
+impl<'a> Buy<'a> {
+    pub const DISCRIMINATOR: &'a u8 = &10;
+
+    pub fn process(&mut self) -> ProgramResult {
+        // The pull must be the PDA for (pool, client_seed, bump)
+        let pull_key = create_program_address(
             &[
-                Seed::from(PULL_SEED),
-                Seed::from(self.pool.key()),
-                Seed::from(&index_seed),
-                Seed::from(&bump_seed),
+                PULL_SEED,
+                self.accounts.pool.key(),
+                self.instruction_data.client_seed,
+                &[self.instruction_data.bump],
             ],
-        )?;
-        let pool = unsafe { Pool::from_bytes_unchecked_mut(self.pool.borrow_mut_data_unchecked()) };
-        let pull = unsafe { Pull::from_bytes_unchecked_mut(self.pull.borrow_mut_data_unchecked()) };
-        pull.set_version(PULL_VERSION);
-        pull.set_bump(self.bump);
-        pull.set_status(STATUS_PENDING);
-        pull.set_count(self.count);
-        pull.set_inventory_version(pool.inventory_version());
-        pull.set_index(self.index);
-        pull.set_deadline_slot(self.deadline_slot);
-        pull.set_pool(*self.pool.key());
-        pull.set_buyer(*self.buyer.key());
-        pull.set_client_seed(*self.client_seed);
-
-        pool.set_pending_draws(self.pending_draws);
-        pool.set_next_index(self.next_index);
-
-        Transfer {
-            from: self.buyer_ata,
-            to: self.vault,
-            authority: self.buyer,
-            amount: self.amount,
+            &crate::ID,
+        )
+        .map_err(|_| GachaError::InvalidSeeds)?;
+        if pull_key.ne(self.accounts.pull.key()) {
+            return Err(GachaError::InvalidSeeds.into());
         }
-        .invoke()
+
+        // The candidate list the buyer signed for must be the current one
+        let pool = Pool::load_mut(self.accounts.pool)?;
+        if self
+            .instruction_data
+            .inventory_version
+            .ne(&pool.inventory_version())
+        {
+            return Err(GachaError::InventoryChanged.into());
+        }
+
+        // FIFO makes candidate prefixes nested: every older pending draw can consume at
+        // most one item in this prefix, so this reserves enough eligible stock for this
+        // purchase even if no further deposits arrive
+        let count = self.instruction_data.count as u64;
+        let pending_draws = pool.pending_draws() + count;
+        if pending_draws > pool.remaining() {
+            return Err(GachaError::SoldOut.into());
+        }
+
+        // The vault must cover every pending refund plus penalty once this payment lands
+        let amount = pool.payment(count)?;
+        let vault = TokenAccount::load(self.accounts.vault)?;
+        if vault.amount + amount < pool.refund_amount(pending_draws)? {
+            return Err(GachaError::InsufficientBalance.into());
+        }
+
+        // Create the Pull account
+        let seeds = Pull::seeds(
+            self.accounts.pool.key(),
+            self.instruction_data.client_seed,
+            self.instruction_data.bump,
+        );
+        create_pda(
+            self.accounts.buyer,
+            self.accounts.pull,
+            PULL_LEN,
+            &seeds.as_seeds(),
+        )?;
+
+        // Populate it and take the next FIFO index
+        let index = pool.next_index();
+        let pull = Pull::load_new(self.accounts.pull)?;
+        pull.set_inner(
+            self.instruction_data.bump,
+            self.instruction_data.count,
+            pool.inventory_version(),
+            index,
+            Clock::get()?.slot + pool.deadline_slots(),
+            self.accounts.pool.key(),
+            self.accounts.buyer.key(),
+            self.instruction_data.client_seed,
+        );
+        pool.set_pending_draws(pending_draws);
+        pool.set_next_index(index + 1);
+
+        // Escrow the payment
+        Transfer {
+            from: self.accounts.buyer_ata,
+            to: self.accounts.vault,
+            authority: self.accounts.buyer,
+            amount,
+        }
+        .invoke()?;
+
+        // Log the Buy Event
+        BuyEvent {
+            pool: self.accounts.pool.key(),
+            pull: self.accounts.pull.key(),
+            buyer: self.accounts.buyer.key(),
+            index,
+            count: self.instruction_data.count,
+        }
+        .emit(self.accounts.event_authority, self.accounts.program)
     }
 }

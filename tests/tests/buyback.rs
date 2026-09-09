@@ -92,6 +92,7 @@ fn buyback_binds_terms_and_seller_authorization_and_expires_at_the_deadline() {
         );
     }
     let mut ix = good.clone();
+    // A different asset account is bound by the signature, checked before the Core transfer.
     ix.accounts[4].pubkey = f.payment_mint;
     assert_eq!(
         custom_error(&f.run(&ix)),
@@ -102,7 +103,7 @@ fn buyback_binds_terms_and_seller_authorization_and_expires_at_the_deadline() {
         ..quote
     };
     let mut ix = good.clone();
-    ix.data[18..].copy_from_slice(
+    ix.data[18..82].copy_from_slice(
         &SigningKey::from_bytes(&AUTHORITY_SEED)
             .sign(&other.message())
             .to_bytes(),
