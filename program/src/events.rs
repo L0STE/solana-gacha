@@ -1,5 +1,5 @@
 //! One event per instruction, emitted through a CPI to this program signed by
-//! the event authority PDA. The `sink` instruction accepts only that signer,
+//! the event authority PDA. The `EmitEvent` instruction accepts only that signer,
 //! so events live in inner instructions and no other program can forge them.
 //! The CPI needs the program's own account, so every instruction carries
 //! `event_authority` and `program` as its last two accounts; the CPI itself
@@ -24,7 +24,7 @@ use pinocchio::{
 /// The instruction every event CPI targets. It does nothing; the inner
 /// instruction's data is the event. Only the event authority PDA can sign it,
 /// and only this program can sign for that PDA.
-pub fn sink(accounts: &[AccountInfo]) -> ProgramResult {
+pub fn emit_event(accounts: &[AccountInfo]) -> ProgramResult {
     let [event_authority, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };

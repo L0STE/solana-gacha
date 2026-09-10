@@ -56,8 +56,8 @@ fn process_instruction(
         Some((SetStatus::DISCRIMINATOR, data)) => SetStatus::try_from((data, accounts))?.process(),
         Some((Reclaim::DISCRIMINATOR, _)) => Reclaim::try_from(accounts)?.process(),
 
-        // Self-CPI event sink - Discriminator 255
-        Some((&constants::EVENT_DISCRIMINATOR, _)) => events::sink(accounts),
+        // Self-CPI EmitEvent - Discriminator 255
+        Some((&constants::EVENT_DISCRIMINATOR, _)) => events::emit_event(accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
